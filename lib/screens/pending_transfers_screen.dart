@@ -265,12 +265,12 @@ class _PendingTransfersScreenState extends State<PendingTransfersScreen> {
                                 children: [
                                   Expanded(
                                     child: _siteChip(
-                                      icon: Icons.logout,
-                                      label: 'From',
-                                      site:
-                                          req['current_site_name'] ?? '',
-                                      color: Colors.grey.shade700,
-                                    ),
+  icon: Icons.logout,
+  label: 'From',
+  site: req['current_site_name'] ?? '',
+  shiftType: req['current_shift_type'],
+  color: Colors.grey.shade700,
+),
                                   ),
                                   const Icon(
                                     Icons.arrow_forward,
@@ -279,11 +279,12 @@ class _PendingTransfersScreenState extends State<PendingTransfersScreen> {
                                   ),
                                   Expanded(
                                     child: _siteChip(
-                                      icon: Icons.login,
-                                      label: 'To',
-                                      site: req['target_site_name'] ?? '',
-                                      color: Colors.green.shade700,
-                                    ),
+  icon: Icons.login,
+  label: 'To',
+  site: req['target_site_name'] ?? '',
+  shiftType: req['target_shift_type'],
+  color: Colors.green.shade700,
+),
                                   ),
                                 ],
                               ),
@@ -382,34 +383,64 @@ class _PendingTransfersScreenState extends State<PendingTransfersScreen> {
     );
   }
 
-  Widget _siteChip({
-    required IconData icon,
-    required String label,
-    required String site,
-    required Color color,
-  }) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
+Widget _siteChip({
+  required IconData icon,
+  required String label,
+  required String site,
+  required String? shiftType,
+  required Color color,
+}) {
+  final bool isNight = shiftType == 'Night';
+
+  return Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      Row(
+        children: [
+          Icon(icon, size: 14, color: color),
+          const SizedBox(width: 4),
+          Text(
+            label,
+            style: TextStyle(
+              fontSize: 11,
+              color: color,
+            ),
+          ),
+        ],
+      ),
+      const SizedBox(height: 2),
+      Text(
+        site,
+        style: const TextStyle(
+          fontWeight: FontWeight.w600,
+          fontSize: 13,
+        ),
+        overflow: TextOverflow.ellipsis,
+      ),
+      if (shiftType != null) ...[
+        const SizedBox(height: 4),
         Row(
           children: [
-            Icon(icon, size: 14, color: color),
+            Icon(
+              isNight
+                  ? Icons.nightlight_outlined
+                  : Icons.wb_sunny_outlined,
+              size: 13,
+              color: Colors.grey.shade600,
+            ),
             const SizedBox(width: 4),
             Text(
-              label,
-              style: TextStyle(fontSize: 11, color: color),
+              shiftType!,
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+                color: Colors.grey.shade700,
+              ),
             ),
           ],
         ),
-        const SizedBox(height: 2),
-        Text(
-          site,
-          style: const TextStyle(
-            fontWeight: FontWeight.w600,
-            fontSize: 13,
-          ),
-        ),
       ],
-    );
-  }
+    ],
+  );
+}
 }

@@ -990,14 +990,14 @@ final response = await ApiConfig.dio.post(
                   textAlign: TextAlign.center,
                 ),
                 const SizedBox(height: 6),
-                Text(
-                  'Current Site: ${widget.siteName}',
-                  style: TextStyle(
-                    fontSize: 13,
-                    color: Colors.grey.shade600,
-                  ),
-                  textAlign: TextAlign.center,
-                ),
+            Text(
+  'Current Shift: ${widget.shiftType}',
+  style: TextStyle(
+    fontSize: 13,
+    color: Colors.grey.shade600,
+  ),
+  textAlign: TextAlign.center,
+),
                 const SizedBox(height: 20),
                 if (_mySitesForTransfer
                     .where(
@@ -1062,15 +1062,16 @@ final response = await ApiConfig.dio.post(
                               try {
                                 await ApiConfig.dio.post(
                                   '/transfers',
-                                  data: {
-                                    'worker_id':
-                                        worker['worker_id'],
-                                    'current_site_id':
-                                        widget.siteId,
-                                    'target_site_id':
-                                        selectedTargetSite![
-                                            'site_id'],
-                                  },
+                                data: {
+  'worker_id':
+      worker['worker_id'],
+  'current_site_id':
+      widget.siteId,
+  'current_shift_type':
+      widget.shiftType,
+  'target_site_id':
+      selectedTargetSite!['site_id'],
+},
                                 );
 
                                 if (!mounted) return;

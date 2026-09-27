@@ -560,112 +560,260 @@ Future<void> _showManagementLeaveDialog(
     );
   }
 
-  // Site-level section within a date: its own bulk select + bulk actions.
-  Widget _siteSection(String date, String siteName, List<Map<String, dynamic>> items) {
-    final ids = _idsOf(items);
-    final allSelected = ids.isNotEmpty && ids.every(_selectedIds.contains);
-    final selected = ids.where(_selectedIds.contains).toList();
-    final overtimeCount = items.where((i) => (double.tryParse('${i['overtime_hours'] ?? 0}') ?? 0) > 0).length;
+Widget _siteSection(String date, String siteName, List<Map<String, dynamic>> items) {
+  final ids = _idsOf(items);
+  final allSelected = ids.isNotEmpty && ids.every(_selectedIds.contains);
 
-    return Container(
-      margin: const EdgeInsets.only(bottom: 10),
-      padding: const EdgeInsets.all(10),
-      decoration: BoxDecoration(
-        color: Colors.grey.shade50,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.grey.shade200),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Checkbox(
-                value: allSelected,
-                tristate: true,
-                visualDensity: VisualDensity.compact,
-                onChanged: (value) => setState(() {
-                  if (value == true) {
-                    _selectedIds.addAll(ids);
-                  } else {
-                    _selectedIds.removeAll(ids);
-                  }
-                }),
+  final shiftGroups = <String, List<Map<String, dynamic>>>{};
+
+  for (final item in items) {
+    final shift = item['shift_type'] == 'Night' ? 'Night' : 'Day';
+    shiftGroups.putIfAbsent(shift, () => []).add(item);
+  }
+
+  return Container(
+    margin: const EdgeInsets.only(bottom: 10),
+    padding: const EdgeInsets.all(10),
+    decoration: BoxDecoration(
+      color: Colors.grey.shade50,
+      borderRadius: BorderRadius.circular(12),
+      border: Border.all(color: Colors.grey.shade200),
+    ),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Checkbox(
+              value: allSelected,
+              tristate: true,
+              visualDensity: VisualDensity.compact,
+              onChanged: (value) => setState(() {
+                if (value == true) {
+                  _selectedIds.addAll(ids);
+                } else {
+                  _selectedIds.removeAll(ids);
+                }
+              }),
+            ),
+            Icon(
+              Icons.location_on,
+              size: 15,
+              color: Colors.grey.shade600,
+            ),
+            const SizedBox(width: 4),
+            Expanded(
+              child: Text(
+                siteName,
+                style: const TextStyle(
+                  fontWeight: FontWeight.w700,
+                  fontSize: 13.5,
+                ),
+                overflow: TextOverflow.ellipsis,
               ),
-              Icon(Icons.location_on, size: 15, color: Colors.grey.shade600),
-              const SizedBox(width: 4),
-              Expanded(
-                child: Text(
-                  siteName,
-                  style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 13.5),
-                  overflow: TextOverflow.ellipsis,
-                ),
+            ),
+            Text(
+              '${items.length}',
+              style: TextStyle(
+                color: Colors.grey.shade600,
+                fontSize: 11.5,
               ),
-              if (overtimeCount > 0)
-                Container(
-                  margin: const EdgeInsets.only(right: 6),
-                  padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-                  decoration: BoxDecoration(
-                    color: Colors.deepPurple.withOpacity(.10),
-                    borderRadius: BorderRadius.circular(20),
-                  ),
-                  child: Text(
-                    '$overtimeCount OT',
-                    style: TextStyle(fontSize: 10.5, fontWeight: FontWeight.w700, color: Colors.deepPurple.shade400),
-                  ),
-                ),
-              Text('${items.length}', style: TextStyle(color: Colors.grey.shade600, fontSize: 11.5)),
-            ],
-          ),
-          if (selected.isNotEmpty) ...[
-            const SizedBox(height: 6),
-            Padding(
-              padding: const EdgeInsets.only(left: 40),
-              child: Wrap(spacing: 6, runSpacing: 6, children: [
-                FilledButton.icon(
-                  onPressed: _working ? null : () => _reviewSelected(selected, 'Approved'),
-                  icon: const Icon(Icons.check, size: 15),
-                  label: Text('Approve ${selected.length}', style: const TextStyle(fontSize: 12)),
-                  style: FilledButton.styleFrom(
-                    backgroundColor: Colors.green.shade700,
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                  ),
-                ),
-                FilledButton.icon(
-                  onPressed: _working
-                      ? null
-                      : () async {
-                          final note = await _promptForReason(context);
-                          if (note != null) await _reviewSelected(selected, 'Rejected', note: note);
-                        },
-                  icon: const Icon(Icons.close, size: 15),
-                  label: Text('Reject ${selected.length}', style: const TextStyle(fontSize: 12)),
-                  style: FilledButton.styleFrom(
-                    backgroundColor: Colors.red.shade700,
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                  ),
-                ),
-              ]),
             ),
           ],
-          const SizedBox(height: 8),
-          // Compact per-worker cards, 2-column wrap on wide screens.
-          LayoutBuilder(builder: (context, constraints) {
-            final columns = constraints.maxWidth > 700 ? 2 : 1;
-            if (columns == 1) {
-              return Column(children: items.map(_workerCard).toList());
-            }
-            final cardWidth = (constraints.maxWidth - 8) / 2;
-            return Wrap(
-              spacing: 8,
-              runSpacing: 0,
-              children: items.map((item) => SizedBox(width: cardWidth, child: _workerCard(item))).toList(),
-            );
-          }),
-        ],
-      ),
-    );
-  }
+        ),
+
+        const SizedBox(height: 8),
+
+        ...shiftGroups.entries.map((entry) {
+          final shiftType = entry.key;
+          final shiftItems = entry.value;
+
+          final shiftIds = _idsOf(shiftItems);
+          final shiftSelected =
+              shiftIds.isNotEmpty && shiftIds.every(_selectedIds.contains);
+
+          final selected = shiftIds
+              .where(_selectedIds.contains)
+              .toList();
+
+          final overtimeCount = shiftItems.where(
+            (i) =>
+                (double.tryParse(
+                      '${i['overtime_hours'] ?? 0}',
+                    ) ??
+                    0) >
+                0,
+          ).length;
+
+          final isNight = shiftType == 'Night';
+
+          return Container(
+            margin: const EdgeInsets.only(bottom: 8),
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: Colors.grey.shade200),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Checkbox(
+                      value: shiftSelected,
+                      tristate: true,
+                      visualDensity: VisualDensity.compact,
+                      onChanged: (value) => setState(() {
+                        if (value == true) {
+                          _selectedIds.addAll(shiftIds);
+                        } else {
+                          _selectedIds.removeAll(shiftIds);
+                        }
+                      }),
+                    ),
+                    Icon(
+                      isNight
+                          ? Icons.nightlight_outlined
+                          : Icons.wb_sunny_outlined,
+                      size: 16,
+                    ),
+                    const SizedBox(width: 5),
+                    Text(
+                      shiftType,
+                      style: const TextStyle(
+                        fontWeight: FontWeight.w700,
+                        fontSize: 12.5,
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      '${shiftItems.length}',
+                      style: TextStyle(
+                        color: Colors.grey.shade600,
+                        fontSize: 11,
+                      ),
+                    ),
+                    const Spacer(),
+                    if (overtimeCount > 0)
+                      Container(
+                        margin: const EdgeInsets.only(right: 6),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 7,
+                          vertical: 2,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.deepPurple.withOpacity(.10),
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        child: Text(
+                          '$overtimeCount OT',
+                          style: TextStyle(
+                            fontSize: 10.5,
+                            fontWeight: FontWeight.w700,
+                            color: Colors.deepPurple.shade400,
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+
+                if (selected.isNotEmpty) ...[
+                  const SizedBox(height: 6),
+                  Padding(
+                    padding: const EdgeInsets.only(left: 40),
+                    child: Wrap(
+                      spacing: 6,
+                      runSpacing: 6,
+                      children: [
+                        FilledButton.icon(
+                          onPressed: _working
+                              ? null
+                              : () => _reviewSelected(
+                                    selected,
+                                    'Approved',
+                                  ),
+                          icon: const Icon(Icons.check, size: 15),
+                          label: Text(
+                            'Approve ${selected.length}',
+                            style: const TextStyle(fontSize: 12),
+                          ),
+                          style: FilledButton.styleFrom(
+                            backgroundColor: Colors.green.shade700,
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 10,
+                              vertical: 6,
+                            ),
+                          ),
+                        ),
+                        FilledButton.icon(
+                          onPressed: _working
+                              ? null
+                              : () async {
+                                  final note =
+                                      await _promptForReason(context);
+                                  if (note != null) {
+                                    await _reviewSelected(
+                                      selected,
+                                      'Rejected',
+                                      note: note,
+                                    );
+                                  }
+                                },
+                          icon: const Icon(Icons.close, size: 15),
+                          label: Text(
+                            'Reject ${selected.length}',
+                            style: const TextStyle(fontSize: 12),
+                          ),
+                          style: FilledButton.styleFrom(
+                            backgroundColor: Colors.red.shade700,
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 10,
+                              vertical: 6,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+
+                const SizedBox(height: 8),
+
+                LayoutBuilder(
+                  builder: (context, constraints) {
+                    final columns = constraints.maxWidth > 700 ? 2 : 1;
+
+                    if (columns == 1) {
+                      return Column(
+                        children: shiftItems.map(_workerCard).toList(),
+                      );
+                    }
+
+                    final cardWidth = (constraints.maxWidth - 8) / 2;
+
+                    return Wrap(
+                      spacing: 8,
+                      runSpacing: 0,
+                      children: shiftItems
+                          .map(
+                            (item) => SizedBox(
+                              width: cardWidth,
+                              child: _workerCard(item),
+                            ),
+                          )
+                          .toList(),
+                    );
+                  },
+                ),
+              ],
+            ),
+          );
+        }),
+      ],
+    ),
+  );
+}
 
   Widget _dateSection(String date, _SiteGroups sites) {
     final allItemsForDate = sites.values.expand((v) => v).toList();

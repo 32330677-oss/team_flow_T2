@@ -112,6 +112,7 @@ class _WorkerAssignmentScreenState extends State<WorkerAssignmentScreen> {
       final response = await ApiConfig.dio.post('/assignments', data: {
         'worker_id': workerId,
         'site_id': newSiteId,
+        'shift_type': assignment['shift_type'],
       });
 
       if (response.statusCode == 201 || response.statusCode == 200) {

@@ -341,18 +341,21 @@ class _AddAssignmentSheetState extends State<_AddAssignmentSheet> {
   int? _selectedSiteId;
   Map<String, dynamic>? _selectedWorkerObj;
   Map<String, dynamic>? _selectedSiteObj;
+  String _selectedShiftType = 'Day';
   bool _isSubmitting = false;
   String? _errorMessage;
 
-final _assignedDateController = TextEditingController(
-  text: DateTime.now().toIso8601String().split('T')[0],
-);
-@override
-void dispose() {
-  _assignedDateController.dispose();
-  super.dispose();
-}
-Future<void> _submit() async {
+  final _assignedDateController = TextEditingController(
+    text: DateTime.now().toIso8601String().split('T')[0],
+  );
+
+  @override
+  void dispose() {
+    _assignedDateController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
     setState(() => _errorMessage = null);
 
     if (_selectedWorkerId == null || _selectedSiteId == null) {
@@ -398,6 +401,9 @@ Future<void> _submit() async {
         'worker_id': _selectedWorkerId,
         'site_id': _selectedSiteId,
         'assigned_date': assignedDate,
+        'shift_type': (_selectedSiteObj?['supports_shifts'] == 1)
+            ? _selectedShiftType
+            : 'Day',
       });
 
       if (response.statusCode == 201 || response.statusCode == 200) {
@@ -440,6 +446,7 @@ Future<void> _submit() async {
           ),
           const SizedBox(height: 20),
           
+          // حقل اختيار العامل
           InkWell(
             onTap: () async {
               final picked = await SearchablePickerSheet.show<dynamic>(
@@ -474,6 +481,7 @@ Future<void> _submit() async {
           
           const SizedBox(height: 16),
           
+          // حقل اختيار الموقع
           InkWell(
             onTap: () async {
               final picked = await SearchablePickerSheet.show<dynamic>(
@@ -504,7 +512,52 @@ Future<void> _submit() async {
               ),
             ),
           ),
+          
           const SizedBox(height: 16),
+          
+          // اختيار الشيفت (يظهر فقط إذا كان الموقع يدعم الشيفتات supports_shifts == 1)
+          if (_selectedSiteObj?['supports_shifts'] == 1) ...[
+            const Text(
+              'Shift Type',
+              style: TextStyle(
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: RadioListTile<String>(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Day'),
+                    value: 'Day',
+                    groupValue: _selectedShiftType,
+                    onChanged: (value) {
+                      if (value != null) {
+                        setState(() => _selectedShiftType = value);
+                      }
+                    },
+                  ),
+                ),
+                Expanded(
+                  child: RadioListTile<String>(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Night'),
+                    value: 'Night',
+                    groupValue: _selectedShiftType,
+                    onChanged: (value) {
+                      if (value != null) {
+                        setState(() => _selectedShiftType = value);
+                      }
+                    },
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+          ],
+
+          // حقل تاريخ التعيين
           TextField(
             controller: _assignedDateController,
             readOnly: true,
@@ -533,6 +586,7 @@ Future<void> _submit() async {
               }
             },
           ),
+          
           if (_errorMessage != null) ...[
             const SizedBox(height: 16),
             Container(
@@ -544,7 +598,7 @@ Future<void> _submit() async {
               ),
               child: Row(
                 children: [
-                  const Icon(Icons.error_outline, color: AppColors.danger, size: 22),
+                  const Icon(Icons.error_outline, color: Colors.red, size: 22),
                   const SizedBox(width: 10),
                   Expanded(
                     child: Text(
@@ -560,7 +614,7 @@ Future<void> _submit() async {
           const SizedBox(height: 24),
           ElevatedButton(
             style: ElevatedButton.styleFrom(
-              backgroundColor: AppColors.primary,
+              backgroundColor: Colors.blue, // استبدل بـ AppColors.primary إذا كنت تعتمدها
               padding: const EdgeInsets.symmetric(vertical: 15),
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))
             ),

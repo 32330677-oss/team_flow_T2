@@ -5,14 +5,17 @@ import '../widgets/app_data_table.dart';
 import 'rejected_records_screen.dart';
 import 'package:intl/intl.dart';
 
+// في تعريف الـ Widget، أضف الحقل الجديد:
 class SiteAttendanceScreen extends StatefulWidget {
   final int siteId;
   final String siteName;
+  final String shiftType; // 'Day' أو 'Night' — إلزامي الآن
 
   const SiteAttendanceScreen({
     super.key,
     required this.siteId,
     required this.siteName,
+    this.shiftType = 'Day', // افتراضي للمواقع القديمة غير الشيفتية
   });
 
   @override
@@ -44,34 +47,30 @@ class _SiteAttendanceScreenState extends State<SiteAttendanceScreen> {
     _fetchWorkers();
   }
 
-  Future<void> _fetchWorkers() async {
+Future<void> _fetchWorkers() async {
+  if (!mounted) return;
+  setState(() => _isLoading = true);
+  try {
+    final response = await ApiConfig.dio.get(
+      '/attendance/sites/${widget.siteId}/workers',
+      queryParameters: {
+        'record_date': _recordDate,
+        'shift_type': widget.shiftType, // ← جديد
+      },
+    );
     if (!mounted) return;
-
-    setState(() => _isLoading = true);
-
-    try {
-      final response = await ApiConfig.dio.get(
-        '/attendance/sites/${widget.siteId}/workers',
-        queryParameters: {
-          'record_date': _recordDate,
-        },
-      );
-
-      if (!mounted) return;
-
-      setState(() {
-        _workers = response.data['data'] ?? [];
-        _lunchExcludedWorkerIds.clear();
-        _lunchOverrides.clear();
-        _isLoading = false;
-      });
-    } catch (e) {
-      if (!mounted) return;
-
-      setState(() => _isLoading = false);
-      _showToast('Failed to load workers', Colors.red);
-    }
+    setState(() {
+      _workers = response.data['data'] ?? [];
+      _lunchExcludedWorkerIds.clear();
+      _lunchOverrides.clear();
+      _isLoading = false;
+    });
+  } catch (e) {
+    if (!mounted) return;
+    setState(() => _isLoading = false);
+    _showToast('Failed to load workers', Colors.red);
   }
+}
 
   List<dynamic> get _lunchEligibleWorkers {
     return _workers.where((w) {
@@ -99,51 +98,35 @@ class _SiteAttendanceScreenState extends State<SiteAttendanceScreen> {
         .toList();
   }
 
-  Future<void> _handleAction(
-    String endpoint,
-    int workerId, {
-    Map<String, dynamic>? extraData,
-  }) async {
+ Future<void> _handleAction(
+  String endpoint,
+  int workerId, {
+  Map<String, dynamic>? extraData,
+}) async {
+  if (!mounted) return;
+  setState(() => _isLoading = true);
+  try {
+    final Map<String, dynamic> payload = {
+      'worker_id': workerId,
+      'site_id': widget.siteId,
+      'record_date': _recordDate,
+      'shift_type': widget.shiftType, // ← جديد
+    };
+    if (extraData != null) payload.addAll(extraData);
+    await ApiConfig.dio.post(endpoint, data: payload);
+    await _fetchWorkers();
+  } on DioException catch (e) {
     if (!mounted) return;
-
-    setState(() => _isLoading = true);
-
-    try {
-      final Map<String, dynamic> payload = {
-        'worker_id': workerId,
-        'site_id': widget.siteId,
-        'record_date': _recordDate,
-      };
-
-      if (extraData != null) {
-        payload.addAll(extraData);
-      }
-
-      await ApiConfig.dio.post(
-        endpoint,
-        data: payload,
-      );
-
-      await _fetchWorkers();
-    } on DioException catch (e) {
-      if (!mounted) return;
-
-      setState(() => _isLoading = false);
-
-      final data = e.response?.data;
-
-      final msg = data is Map && data['message'] != null
-          ? data['message'].toString()
-          : 'Connection error';
-
-      _showToast(msg, Colors.red);
-    } catch (e) {
-      if (!mounted) return;
-
-      setState(() => _isLoading = false);
-      _showToast('Connection error', Colors.red);
-    }
+    setState(() => _isLoading = false);
+    final data = e.response?.data;
+    final msg = data is Map && data['message'] != null ? data['message'].toString() : 'Connection error';
+    _showToast(msg, Colors.red);
+  } catch (e) {
+    if (!mounted) return;
+    setState(() => _isLoading = false);
+    _showToast('Connection error', Colors.red);
   }
+}
 
   @override
   void dispose() {
@@ -273,7 +256,9 @@ class _SiteAttendanceScreenState extends State<SiteAttendanceScreen> {
 
     if (result == null) return;
 
-    final payload = <String, dynamic>{};
+ final payload = <String, dynamic>{
+      'shift_type': widget.shiftType, // ← أضفها هنا
+    };
 
     if (result['checkIn'] != null) {
       payload['check_in_time'] = DateFormat(
@@ -419,48 +404,31 @@ List<int> _eligibleSelectedWorkerIdsForAbsent() {
         .toList();
   }
 
-Future<void> _bulkAttendanceAction({
-  required bool checkIn,
-}) async {
+Future<void> _bulkAttendanceAction({required bool checkIn}) async {
   final workerIds = _eligibleSelectedWorkerIds(checkIn);
-
   if (workerIds.isEmpty) {
     _showToast(
-      checkIn
-          ? 'Select workers who are not checked in.'
-          : 'Select workers who are checked in and not checked out.',
+      checkIn ? 'Select workers who are not checked in.' : 'Select workers who are checked in and not checked out.',
       Colors.orange,
     );
     return;
   }
-
   final selectedDateTime = await _pickLocalDateTime(
-    helpText: checkIn
-        ? 'Select Bulk Check-In Time'
-        : 'Select Bulk Check-Out Time',
+    helpText: checkIn ? 'Select Bulk Check-In Time' : 'Select Bulk Check-Out Time',
   );
-
   if (selectedDateTime == null) return;
-
-  if (checkIn) {
-    _setRecordDateFromManualDateTime(
-      selectedDateTime,
-    );
-  }
+  if (checkIn) _setRecordDateFromManualDateTime(selectedDateTime);
 
   setState(() => _isLoading = true);
-
   try {
     final response = await ApiConfig.dio.post(
-      checkIn
-          ? '/attendance/bulk/checkin'
-          : '/attendance/bulk/checkout',
+      checkIn ? '/attendance/bulk/checkin' : '/attendance/bulk/checkout',
       data: {
         'site_id': widget.siteId,
+        'shift_type': widget.shiftType, // ← جديد
         'record_date': _recordDate,
         'worker_ids': workerIds,
-        checkIn
-            ? 'check_in_time'
+        checkIn ? 'check_in_time'
             : 'check_out_time': selectedDateTime,
       },
     );
@@ -578,16 +546,16 @@ Future<void> _bulkMarkAbsent() async {
   setState(() => _isLoading = true);
 
   try {
-    final response = await ApiConfig.dio.post(
-      '/attendance/bulk/status',
-      data: {
-        'site_id': widget.siteId,
-        'record_date': _recordDate,
-        'worker_ids': workerIds,
-        'attendance_status': 'Absent',
-      },
-    );
-
+final response = await ApiConfig.dio.post(
+  '/attendance/bulk/status',
+  data: {
+    'site_id': widget.siteId,
+    'shift_type': widget.shiftType, // ← جديد
+    'record_date': _recordDate,
+    'worker_ids': workerIds,
+    'attendance_status': 'Absent',
+  },
+);
     final data = response.data is Map ? response.data as Map : <String, dynamic>{};
     final successful = (data['successful'] as List?)?.length ?? workerIds.length;
 
@@ -777,8 +745,7 @@ Future<void> _bulkMarkAbsent() async {
   // -------------------------------------------------------------------
   // Opens a manual picker and sends a literal local wall-clock datetime.
   // The selected shift date is propagated separately as record_date.
-  // -------------------------------------------------------------------
-  Future<void> _performCheckIn(
+ Future<void> _performCheckIn(
     int workerId,
   ) async {
     final selectedDateTime = await _pickLocalDateTime(
@@ -796,6 +763,7 @@ Future<void> _bulkMarkAbsent() async {
       workerId,
       extraData: {
         'check_in_time': selectedDateTime,
+        'shift_type': widget.shiftType, // ← تأكد من إضافتها هنا أيضاً
       },
     );
   }
@@ -1335,27 +1303,18 @@ Future<void> _saveLunchTimes() async {
   setState(() => _isLoading = true);
 
   try {
-    final response = await ApiConfig.dio.post(
-      '/attendance/lunch/bulk',
-      data: {
-        'siteId': widget.siteId,
-        'date': _recordDate,
-
-        // إذا ما في Default، نرسل null.
-        'default_start_time':
-            hasDefaultLunch
-                ? _timeText(_defaultLunchStart)
-                : null,
-        'default_end_time':
-            hasDefaultLunch
-                ? _timeText(_defaultLunchEnd)
-                : null,
-
-        'overrides': overrides,
-        'excluded_worker_ids':
-            _lunchExcludedWorkerIds.toList(),
-      },
-    );
+final response = await ApiConfig.dio.post(
+  '/attendance/lunch/bulk',
+  data: {
+    'siteId': widget.siteId,
+    'shift_type': widget.shiftType, // ← جديد
+    'date': _recordDate,
+    'default_start_time': hasDefaultLunch ? _timeText(_defaultLunchStart) : null,
+    'default_end_time': hasDefaultLunch ? _timeText(_defaultLunchEnd) : null,
+    'overrides': overrides,
+    'excluded_worker_ids': _lunchExcludedWorkerIds.toList(),
+  },
+);
 
     await _fetchWorkers();
 
@@ -1503,17 +1462,16 @@ Future<void> _saveLunchTimes() async {
     setState(() => _isLoading = true);
 
     try {
-      final response = await ApiConfig.dio.post(
-        '/attendance/submit',
-        data: {
-          'siteId': widget.siteId,
-          'record_date': _recordDate,
-          if (confirmedLunchSkips != null &&
-              confirmedLunchSkips.isNotEmpty)
-            'confirmed_lunch_skips':
-                confirmedLunchSkips,
-        },
-      );
+final response = await ApiConfig.dio.post(
+  '/attendance/submit',
+  data: {
+    'siteId': widget.siteId,
+    'shift_type': widget.shiftType, // ← جديد
+    'record_date': _recordDate,
+    if (confirmedLunchSkips != null && confirmedLunchSkips.isNotEmpty)
+      'confirmed_lunch_skips': confirmedLunchSkips,
+  },
+);
 
       final data = response.data is Map
           ? response.data as Map
@@ -2460,28 +2418,13 @@ SizedBox(
         backgroundColor:
             const Color(0xff1a2a6c),
         elevation: 0,
-        title: Column(
-          crossAxisAlignment:
-              CrossAxisAlignment.start,
-          children: [
-            Text(
-              widget.siteName,
-              style: const TextStyle(
-                fontSize: 16,
-                fontWeight:
-                    FontWeight.bold,
-                color: Colors.white,
-              ),
-            ),
-            const Text(
-              'Daily Attendance',
-              style: TextStyle(
-                fontSize: 11,
-                color: Colors.white70,
-              ),
-            ),
-          ],
-        ),
+     title: Column(
+  crossAxisAlignment: CrossAxisAlignment.start,
+  children: [
+    Text(widget.siteName, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white)),
+    Text('Daily Attendance — ${widget.shiftType} Shift', style: const TextStyle(fontSize: 11, color: Colors.white70)),
+  ],
+),
         iconTheme: const IconThemeData(
           color: Colors.white,
         ),

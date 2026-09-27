@@ -183,17 +183,18 @@ class _SupervisorDashboardState extends State<SupervisorDashboard> {
                                 borderRadius: BorderRadius.circular(16),
                                 child: InkWell(
                                   borderRadius: BorderRadius.circular(16),
-                                  onTap: () {
-                                    Navigator.push(
-                                      context,
-                                      MaterialPageRoute(
-                                        builder: (_) => SiteAttendanceScreen(
-                                          siteId: site['site_id'],
-                                          siteName: site['site_name'] ?? 'Site',
-                                        ),
-                                      ),
-                                    );
-                                  },
+                           onTap: () {
+  Navigator.push(
+    context,
+    MaterialPageRoute(
+      builder: (_) => SiteAttendanceScreen(
+        siteId: site['site_id'],
+        siteName: site['site_name'] ?? 'Site',
+        shiftType: site['my_shift_type'] ?? 'Day', // ← جديد
+      ),
+    ),
+  );
+},
                                   child: Padding(
                                     padding: const EdgeInsets.all(18.0),
                                     child: Row(
@@ -216,10 +217,20 @@ class _SupervisorDashboardState extends State<SupervisorDashboard> {
                                                 style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Color(0xff1a2a6c)),
                                               ),
                                               const SizedBox(height: 4),
-                                              Text(
+                              Text(
   site['location'] ?? 'Tap to manage workers and attendance',
   style: TextStyle(color: Colors.grey.shade600, fontSize: 13, fontWeight: FontWeight.w500),
 ),
+if (site['supports_shifts'] == 1)
+  Container(
+    margin: const EdgeInsets.only(top: 4),
+    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+    decoration: BoxDecoration(color: Colors.indigo.shade50, borderRadius: BorderRadius.circular(6)),
+    child: Text(
+      '${site['my_shift_type'] ?? 'Day'} Shift',
+      style: TextStyle(color: Colors.indigo.shade700, fontSize: 11, fontWeight: FontWeight.bold),
+    ),
+  ),
                                             ],
                                           ),
                                         ),

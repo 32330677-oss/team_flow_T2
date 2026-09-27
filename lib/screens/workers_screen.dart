@@ -108,6 +108,7 @@ _hireDateController.dispose();
     setState(() => _isLoading = true);
     try {
       final response = await ApiConfig.dio.get('/workers');
+      print('WORKERS RESPONSE: ${response.data}');
       if (response.statusCode == 200 && response.data['status'] == 'success') {
         setState(() {
           _workers = response.data['data'];

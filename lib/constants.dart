@@ -4,7 +4,7 @@ import 'package:flutter/material.dart';
 
 class ApiConfig {
   static const String baseUrl =
-    'https://team-flow-backend-f15z.onrender.com/api';
+     'http://localhost:5002/api';
 
   static const FlutterSecureStorage storage = FlutterSecureStorage();
 

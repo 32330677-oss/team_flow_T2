@@ -4,7 +4,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 class AuthService {
   static const String baseUrl =
-      'https://team-flow-backend-f15z.onrender.com/api/auth/';
+      'http://localhost:5002/api/auth/';
 
   static const FlutterSecureStorage storage = FlutterSecureStorage( );
 

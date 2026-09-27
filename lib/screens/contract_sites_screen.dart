@@ -825,15 +825,19 @@ void _showSiteDialog({
                           ],
                         ),
 
-                        subtitle: Padding(
-                          padding: const EdgeInsets.only(
-                            top: 4.0,
-                          ),
-                          child: Text(
-                            'Location: ${site['location'] ?? 'N/A'}\n'
-                            'Supervisor: ${site['supervisor_name'] ?? 'Not assigned'}',
-                          ),
-                        ),
+                  subtitle: Padding(
+  padding: const EdgeInsets.only(
+    top: 4.0,
+  ),
+  child: Text(
+    supportsShifts
+        ? 'Location: ${site['location'] ?? 'N/A'}\n'
+          'Day Supervisor: ${site['day_supervisor_name'] ?? 'Not assigned'}\n'
+          'Night Supervisor: ${site['night_supervisor_name'] ?? 'Not assigned'}'
+        : 'Location: ${site['location'] ?? 'N/A'}\n'
+          'Supervisor: ${site['supervisor_name'] ?? 'Not assigned'}',
+  ),
+),
 
                         trailing: Row(
                           mainAxisSize: MainAxisSize.min,

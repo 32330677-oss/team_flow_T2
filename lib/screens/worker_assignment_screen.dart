@@ -71,63 +71,143 @@ class _WorkerAssignmentScreenState extends State<WorkerAssignmentScreen> {
     }
   }
 
-  // دالة نقل العامل لموقع جديد
-  Future<void> _transferWorker(Map<String, dynamic> assignment) async {
-    final currentSiteId = int.tryParse(assignment['site_id']?.toString() ?? '0') ?? 0;
-    final workerId = int.tryParse(assignment['worker_id']?.toString() ?? '0') ?? 0;
-    final workerName = assignment['worker_name'] ?? 'Worker';
+Future<void> _transferWorker(Map<String, dynamic> assignment) async {
+  final currentSiteId =
+      int.tryParse(assignment['site_id']?.toString() ?? '0') ?? 0;
 
-    // فلترة المواقع لإظهار المواقع الأخرى عدا الموقع الحالي
-    final availableSites = _sites.where((s) {
-      final sId = int.tryParse(s['site_id']?.toString() ?? '0') ?? 0;
-      return sId != currentSiteId;
-    }).toList();
+  final workerId =
+      int.tryParse(assignment['worker_id']?.toString() ?? '0') ?? 0;
 
-    if (availableSites.isEmpty) {
-      _showSnackBar('No other available sites to transfer to', Colors.orange);
-      return;
-    }
+  final workerName = assignment['worker_name'] ?? 'Worker';
 
-    // فتح شاشة بحث واختيار الموقع الجديد
-    final pickedSite = await SearchablePickerSheet.show<dynamic>(
-      context,
-      title: 'Transfer $workerName to New Site',
-      items: availableSites,
-      labelBuilder: (s) => s['site_name'] ?? '',
-    );
+  final currentShiftType =
+      assignment['shift_type']?.toString() == 'Night' ? 'Night' : 'Day';
 
-    if (pickedSite == null) return;
+  // Build Site + Shift target options.
+  final availableTargets = <Map<String, dynamic>>[];
 
-    final newSiteId = int.tryParse(pickedSite['site_id'].toString());
-    final assignmentId = int.tryParse(assignment['assignment_id']?.toString() ?? '0');
+  for (final site in _sites) {
+    final siteId =
+        int.tryParse(site['site_id']?.toString() ?? '0') ?? 0;
 
-    if (newSiteId == null || assignmentId == null) return;
+    if (siteId == 0) continue;
 
-    // إظهار مؤشر تحميل أو تنفيذ النقل
-    try {
-      // 1. حذف القديم أو تعديله حسب الـ API لديك (الطريقة القياسية: حذف التعيين القديم وإنشاء جديد أو استدعاء مسار النقل)
-      // هنا سنقوم بحذف التعيين القديم وإنشاء التعيين الجديد في الموقع الجديد مباشرة لضمان سلامة الـ API
-      await ApiConfig.dio.delete('/assignments/$assignmentId');
-      
-      final response = await ApiConfig.dio.post('/assignments', data: {
-        'worker_id': workerId,
-        'site_id': newSiteId,
-        'shift_type': assignment['shift_type'],
-      });
+    final supportsShifts =
+        site['supports_shifts'] == 1 ||
+        site['supports_shifts'] == true;
 
-      if (response.statusCode == 201 || response.statusCode == 200) {
-        _loadData();
-        _showSnackBar('Worker transferred successfully!', Colors.green.shade700);
+    if (supportsShifts) {
+      // Shift-based site: offer both Day and Night.
+      for (final shift in ['Day', 'Night']) {
+        // Do not offer the exact current site + current shift.
+        if (siteId == currentSiteId &&
+            shift == currentShiftType) {
+          continue;
+        }
+
+        availableTargets.add({
+          'site_id': siteId,
+          'site_name': site['site_name'] ?? '',
+          'shift_type': shift,
+          'display_label':
+              '${site['site_name'] ?? ''} — $shift',
+        });
       }
-    } on DioException catch (e) {
-      final errorMessage = e.response?.data is Map
-          ? (e.response?.data['message'] ?? 'Failed to transfer worker')
-          : 'Failed to transfer worker';
-      _showSnackBar(errorMessage, AppColors.danger);
-    } catch (e) {
-      _showSnackBar('Connection error during transfer', AppColors.danger);
+    } else {
+      // Normal site: one target only.
+      if (siteId == currentSiteId) {
+        continue;
+      }
+
+      availableTargets.add({
+        'site_id': siteId,
+        'site_name': site['site_name'] ?? '',
+        'shift_type': 'Day',
+        'display_label': site['site_name'] ?? '',
+      });
     }
   }
+
+  if (availableTargets.isEmpty) {
+    _showSnackBar(
+      'No other available sites or shifts to transfer to',
+      Colors.orange,
+    );
+    return;
+  }
+
+  final pickedTarget =
+      await SearchablePickerSheet.show<dynamic>(
+    context,
+    title: 'Transfer $workerName to',
+    items: availableTargets,
+    labelBuilder: (target) =>
+        target['display_label']?.toString() ?? '',
+  );
+
+  if (pickedTarget == null) return;
+
+  final newSiteId =
+      int.tryParse(pickedTarget['site_id']?.toString() ?? '');
+
+  final newShiftType =
+      pickedTarget['shift_type']?.toString() == 'Night'
+          ? 'Night'
+          : 'Day';
+
+  final assignmentId =
+      int.tryParse(assignment['assignment_id']?.toString() ?? '');
+
+  if (newSiteId == null || assignmentId == null) {
+    _showSnackBar(
+      'Invalid transfer data',
+      AppColors.danger,
+    );
+    return;
+  }
+
+  try {
+    // End current assignment.
+    await ApiConfig.dio.delete(
+      '/assignments/$assignmentId',
+    );
+
+    // Create the new assignment.
+    final response = await ApiConfig.dio.post(
+      '/assignments',
+      data: {
+        'worker_id': workerId,
+        'site_id': newSiteId,
+        'shift_type': newShiftType,
+      },
+    );
+
+    if (response.statusCode == 201 ||
+        response.statusCode == 200) {
+      await _loadData();
+
+      _showSnackBar(
+        'Worker transferred successfully!',
+        Colors.green.shade700,
+      );
+    }
+  } on DioException catch (e) {
+    final errorMessage = e.response?.data is Map
+        ? (e.response?.data['message'] ??
+            'Failed to transfer worker')
+        : 'Failed to transfer worker';
+
+    _showSnackBar(
+      errorMessage.toString(),
+      AppColors.danger,
+    );
+  } catch (e) {
+    _showSnackBar(
+      'Connection error during transfer',
+      AppColors.danger,
+    );
+  }
+}
 
   void _showSnackBar(String message, Color color, {Duration? duration}) {
     ScaffoldMessenger.of(context).hideCurrentSnackBar();
@@ -164,79 +244,358 @@ class _WorkerAssignmentScreenState extends State<WorkerAssignmentScreen> {
       ),
     );
   }
+@override
+Widget build(BuildContext context) {
+  final filteredSites = _sites.where((site) {
+    final siteName = site['site_name'].toString().toLowerCase();
+    final siteId =
+        int.tryParse(site['site_id']?.toString() ?? '0') ?? 0;
+    final siteWorkers = _getWorkersForSite(siteId);
 
-  @override
-  Widget build(BuildContext context) {
-    final filteredSites = _sites.where((site) {
-      final siteName = site['site_name'].toString().toLowerCase();
-      final siteId = int.tryParse(site['site_id']?.toString() ?? '0') ?? 0;
-      final siteWorkers = _getWorkersForSite(siteId);
-      
-      final matchesSiteName = siteName.contains(_searchQuery.toLowerCase());
-      final matchesWorkerName = siteWorkers.any((w) => 
-        w['worker_name'].toString().toLowerCase().contains(_searchQuery.toLowerCase())
-      );
+    final query = _searchQuery.toLowerCase();
 
-      return matchesSiteName || matchesWorkerName;
-    }).toList();
+    final matchesSiteName = siteName.contains(query);
+    final matchesWorkerName = siteWorkers.any(
+      (w) => w['worker_name']
+          .toString()
+          .toLowerCase()
+          .contains(query),
+    );
 
-    return Scaffold(
-      backgroundColor: Colors.grey[100],
-      appBar: const CustomAppBar(
-        title: 'Workers & Sites Distribution',
-      ),
-      body: _isLoading 
-        ? const Center(child: CircularProgressIndicator()) 
+    return matchesSiteName || matchesWorkerName;
+  }).toList();
+
+  return Scaffold(
+    backgroundColor: Colors.grey[100],
+    appBar: const CustomAppBar(
+      title: 'Workers & Sites Distribution',
+    ),
+    body: _isLoading
+        ? const Center(child: CircularProgressIndicator())
         : Column(
             children: [
               Padding(
                 padding: const EdgeInsets.all(12),
                 child: Row(
                   children: [
-                    _buildStatCard('Sites', _sites.length.toString(), AppColors.primary),
+                    _buildStatCard(
+                      'Sites',
+                      _sites.length.toString(),
+                      AppColors.primary,
+                    ),
                     const SizedBox(width: 10),
-                    _buildStatCard('Assignments', _assignments.length.toString(), Colors.blue.shade700),
+                    _buildStatCard(
+                      'Assignments',
+                      _assignments.length.toString(),
+                      Colors.blue.shade700,
+                    ),
                   ],
                 ),
               ),
+
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 12),
                 child: TextField(
-                  onChanged: (val) => setState(() => _searchQuery = val),
+                  onChanged: (val) =>
+                      setState(() => _searchQuery = val),
                   decoration: InputDecoration(
                     hintText: 'Search by site or worker...',
                     prefixIcon: const Icon(Icons.search),
                     filled: true,
                     fillColor: Colors.white,
-                    contentPadding: const EdgeInsets.symmetric(vertical: 0, horizontal: 20),
-                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(30), borderSide: BorderSide.none),
+                    contentPadding: const EdgeInsets.symmetric(
+                      vertical: 0,
+                      horizontal: 20,
+                    ),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(30),
+                      borderSide: BorderSide.none,
+                    ),
                   ),
                 ),
               ),
+
               const SizedBox(height: 10),
+
               Expanded(
                 child: filteredSites.isEmpty
-                    ? const Center(child: Text('No sites found', style: TextStyle(color: Colors.grey, fontSize: 16)))
+                    ? const Center(
+                        child: Text(
+                          'No sites found',
+                          style: TextStyle(
+                            color: Colors.grey,
+                            fontSize: 16,
+                          ),
+                        ),
+                      )
                     : ListView.builder(
                         padding: const EdgeInsets.all(12),
                         itemCount: filteredSites.length,
                         itemBuilder: (context, index) {
                           final site = filteredSites[index];
-                          final siteId = int.tryParse(site['site_id']?.toString() ?? '0') ?? 0;
-                          final siteWorkers = _getWorkersForSite(siteId);
 
-                          // تحويل العمال إلى صفوف جدول مع إضافة زر النقل (Transfer) وزر الحذف
-                          final rows = List.generate(siteWorkers.length, (wIndex) {
+                          final siteId = int.tryParse(
+                                site['site_id']?.toString() ?? '0',
+                              ) ??
+                              0;
+
+                          final siteWorkers =
+                              _getWorkersForSite(siteId);
+
+                          final supportsShifts =
+                              site['supports_shifts'] == 1 ||
+                              site['supports_shifts'] == true;
+
+                          // ------------------------------------------------
+                          // Helper to build one worker table
+                          // ------------------------------------------------
+                          Widget buildWorkerTable({
+                            required String title,
+                            required List<dynamic> workers,
+                            required IconData shiftIcon,
+                            required Color shiftColor,
+                          }) {
+                            final rows =
+                                List.generate(workers.length, (wIndex) {
+                              final assignment = workers[wIndex];
+
+                              return DataRow(
+                                cells: [
+                                  DataCell(
+                                    Text('${wIndex + 1}'),
+                                  ),
+                                  DataCell(
+                                    Row(
+                                      children: [
+                                        const Icon(
+                                          Icons.person_outline,
+                                          size: 16,
+                                          color: Colors.grey,
+                                        ),
+                                        const SizedBox(width: 8),
+                                        Text(
+                                          assignment['worker_name'] ??
+                                              'N/A',
+                                          style: const TextStyle(
+                                            fontWeight: FontWeight.w500,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                  DataCell(
+                                    Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        IconButton(
+                                          icon: const Icon(
+                                            Icons.swap_horiz,
+                                            color: Colors.blue,
+                                            size: 20,
+                                          ),
+                                          tooltip: 'Transfer Worker',
+                                          onPressed: () =>
+                                              _transferWorker(
+                                            assignment,
+                                          ),
+                                        ),
+                                        IconButton(
+                                          icon: const Icon(
+                                            Icons.delete_forever,
+                                            color: AppColors.danger,
+                                            size: 20,
+                                          ),
+                                          tooltip: 'End Assignment',
+                                          onPressed: () =>
+                                              _deleteAssignment(
+                                            assignment[
+                                                'assignment_id'],
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ],
+                              );
+                            });
+
+                            return Padding(
+                              padding: const EdgeInsets.only(
+                                bottom: 12,
+                              ),
+                              child: AppDataTableCard(
+                                title: title,
+                                icon: shiftIcon,
+                                accentColor: shiftColor,
+                                emptyMessage:
+                                    'No workers assigned to this shift.',
+                                trailing: Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 10,
+                                    vertical: 4,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color:
+                                        shiftColor.withOpacity(0.10),
+                                    borderRadius:
+                                        BorderRadius.circular(10),
+                                  ),
+                                  child: Text(
+                                    'Workers: ${workers.length}',
+                                    style: TextStyle(
+                                      color: shiftColor,
+                                      fontWeight: FontWeight.bold,
+                                      fontSize: 12,
+                                    ),
+                                  ),
+                                ),
+                                columns: const [
+                                  DataColumn(label: Text('#')),
+                                  DataColumn(
+                                    label: Text('Worker Name'),
+                                  ),
+                                  DataColumn(
+                                    label: Text('Actions'),
+                                  ),
+                                ],
+                                rows: rows,
+                              ),
+                            );
+                          }
+
+                          // =================================================
+                          // SHIFT-BASED SITE
+                          // =================================================
+                          if (supportsShifts) {
+                            final dayWorkers =
+                                siteWorkers.where((worker) {
+                              final shift =
+                                  worker['shift_type']?.toString();
+
+                              return shift != 'Night';
+                            }).toList();
+
+                            final nightWorkers =
+                                siteWorkers.where((worker) {
+                              return worker['shift_type']
+                                      ?.toString() ==
+                                  'Night';
+                            }).toList();
+
+                            return Padding(
+                              padding: const EdgeInsets.only(
+                                bottom: 16,
+                              ),
+                              child: Column(
+                                crossAxisAlignment:
+                                    CrossAxisAlignment.stretch,
+                                children: [
+                                  // Site header
+                                  Padding(
+                                    padding: const EdgeInsets.only(
+                                      bottom: 10,
+                                      left: 4,
+                                      right: 4,
+                                    ),
+                                    child: Row(
+                                      children: [
+                                        const Icon(
+                                          Icons.business,
+                                          size: 20,
+                                          color: AppColors.primary,
+                                        ),
+                                        const SizedBox(width: 8),
+                                        Expanded(
+                                          child: Text(
+                                            site['site_name'] ??
+                                                'Unknown Site',
+                                            style: const TextStyle(
+                                              fontSize: 17,
+                                              fontWeight:
+                                                  FontWeight.bold,
+                                            ),
+                                          ),
+                                        ),
+                                        Container(
+                                          padding:
+                                              const EdgeInsets.symmetric(
+                                            horizontal: 10,
+                                            vertical: 4,
+                                          ),
+                                          decoration: BoxDecoration(
+                                            color: Colors.blue.shade50,
+                                            borderRadius:
+                                                BorderRadius.circular(
+                                              10,
+                                            ),
+                                          ),
+                                          child: Text(
+                                            'Workers: ${siteWorkers.length}',
+                                            style: TextStyle(
+                                              color:
+                                                  Colors.blue.shade900,
+                                              fontWeight:
+                                                  FontWeight.bold,
+                                              fontSize: 12,
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+
+                                  // Day
+                                  buildWorkerTable(
+                                    title: 'Day Shift',
+                                    workers: dayWorkers,
+                                    shiftIcon:
+                                        Icons.wb_sunny_outlined,
+                                    shiftColor:
+                                        Colors.orange.shade700,
+                                  ),
+
+                                  // Night
+                                  buildWorkerTable(
+                                    title: 'Night Shift',
+                                    workers: nightWorkers,
+                                    shiftIcon:
+                                        Icons.nightlight_outlined,
+                                    shiftColor:
+                                        Colors.indigo.shade700,
+                                  ),
+                                ],
+                              ),
+                            );
+                          }
+
+                          // =================================================
+                          // NORMAL SITE — NO SHIFTS
+                          // =================================================
+                          final rows =
+                              List.generate(siteWorkers.length, (wIndex) {
                             final assignment = siteWorkers[wIndex];
+
                             return DataRow(
                               cells: [
-                                DataCell(Text('${wIndex + 1}')),
+                                DataCell(
+                                  Text('${wIndex + 1}'),
+                                ),
                                 DataCell(
                                   Row(
                                     children: [
-                                      const Icon(Icons.person_outline, size: 16, color: Colors.grey),
+                                      const Icon(
+                                        Icons.person_outline,
+                                        size: 16,
+                                        color: Colors.grey,
+                                      ),
                                       const SizedBox(width: 8),
-                                      Text(assignment['worker_name'] ?? 'N/A', style: const TextStyle(fontWeight: FontWeight.w500)),
+                                      Text(
+                                        assignment['worker_name'] ??
+                                            'N/A',
+                                        style: const TextStyle(
+                                          fontWeight: FontWeight.w500,
+                                        ),
+                                      ),
                                     ],
                                   ),
                                 ),
@@ -244,17 +603,30 @@ class _WorkerAssignmentScreenState extends State<WorkerAssignmentScreen> {
                                   Row(
                                     mainAxisSize: MainAxisSize.min,
                                     children: [
-                                      // زر النقل (Transfer)
                                       IconButton(
-                                        icon: const Icon(Icons.swap_horiz, color: Colors.blue, size: 20),
+                                        icon: const Icon(
+                                          Icons.swap_horiz,
+                                          color: Colors.blue,
+                                          size: 20,
+                                        ),
                                         tooltip: 'Transfer Worker',
-                                        onPressed: () => _transferWorker(assignment),
+                                        onPressed: () =>
+                                            _transferWorker(
+                                          assignment,
+                                        ),
                                       ),
-                                      // زر الحذف (End Assignment)
                                       IconButton(
-                                        icon: const Icon(Icons.delete_forever, color: AppColors.danger, size: 20),
+                                        icon: const Icon(
+                                          Icons.delete_forever,
+                                          color: AppColors.danger,
+                                          size: 20,
+                                        ),
                                         tooltip: 'End Assignment',
-                                        onPressed: () => _deleteAssignment(assignment['assignment_id']),
+                                        onPressed: () =>
+                                            _deleteAssignment(
+                                          assignment[
+                                              'assignment_id'],
+                                        ),
                                       ),
                                     ],
                                   ),
@@ -264,27 +636,44 @@ class _WorkerAssignmentScreenState extends State<WorkerAssignmentScreen> {
                           });
 
                           return Padding(
-                            padding: const EdgeInsets.only(bottom: 16),
+                            padding: const EdgeInsets.only(
+                              bottom: 16,
+                            ),
                             child: AppDataTableCard(
-                              title: site['site_name'] ?? 'Unknown Site',
+                              title: site['site_name'] ??
+                                  'Unknown Site',
                               icon: Icons.business,
                               accentColor: AppColors.primary,
-                              emptyMessage: 'No workers assigned to this site yet.',
+                              emptyMessage:
+                                  'No workers assigned to this site yet.',
                               trailing: Container(
-                                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                                padding:
+                                    const EdgeInsets.symmetric(
+                                  horizontal: 10,
+                                  vertical: 4,
+                                ),
                                 decoration: BoxDecoration(
                                   color: Colors.blue.shade50,
-                                  borderRadius: BorderRadius.circular(10),
+                                  borderRadius:
+                                      BorderRadius.circular(10),
                                 ),
                                 child: Text(
                                   'Workers: ${siteWorkers.length}',
-                                  style: TextStyle(color: Colors.blue.shade900, fontWeight: FontWeight.bold, fontSize: 12),
+                                  style: TextStyle(
+                                    color: Colors.blue.shade900,
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 12,
+                                  ),
                                 ),
                               ),
                               columns: const [
                                 DataColumn(label: Text('#')),
-                                DataColumn(label: Text('Worker Name')),
-                                DataColumn(label: Text('Actions')),
+                                DataColumn(
+                                  label: Text('Worker Name'),
+                                ),
+                                DataColumn(
+                                  label: Text('Actions'),
+                                ),
                               ],
                               rows: rows,
                             ),
@@ -294,13 +683,16 @@ class _WorkerAssignmentScreenState extends State<WorkerAssignmentScreen> {
               ),
             ],
           ),
-      floatingActionButton: FloatingActionButton(
-        backgroundColor: AppColors.primary,
-        onPressed: _openAddSheet,
-        child: const Icon(Icons.person_add_alt_1, color: Colors.white),
+    floatingActionButton: FloatingActionButton(
+      backgroundColor: AppColors.primary,
+      onPressed: _openAddSheet,
+      child: const Icon(
+        Icons.person_add_alt_1,
+        color: Colors.white,
       ),
-    );
-  }
+    ),
+  );
+}
 
   Widget _buildStatCard(String title, String value, Color color) {
     return Expanded(

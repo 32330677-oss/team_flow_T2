@@ -14,7 +14,7 @@ import 'pending_transfers_screen.dart';
 import 'staff_attendance_payroll_hub.dart';
 import 'payroll_screen.dart';
 import 'admin_attendance_screen.dart';
-
+import 'biometric_import_screen.dart';
 class DashColors {
   // Dark-mode surface colors: a deeper shade of the app's own navy brand
   // color instead of an unrelated tech-blue palette, so night mode still
@@ -98,6 +98,10 @@ class _AnalyticsDashboardScreenState
         _SidebarItem(
       icon: Icons.fingerprint_rounded,
       label: 'Biometric Processing',
+    ),
+        _SidebarItem(
+      icon: Icons.upload_file_rounded,
+      label: 'Biometric Import',
     ),
   ];
 
@@ -361,6 +365,9 @@ class _AnalyticsDashboardScreenState
         break;
       case 10:
         destination = const BiometricProcessingScreen();
+        break;
+      case 11:
+        destination = const BiometricImportScreen();
         break;
       default:
         return;

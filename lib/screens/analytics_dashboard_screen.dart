@@ -3,7 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:intl/intl.dart';
 import 'package:team_flow/constants.dart';
-
+import 'biometric_processing_screen.dart';
 import 'login_screen.dart';
 import 'project_management_screen.dart';
 import 'worker_assignment_screen.dart';
@@ -94,6 +94,10 @@ class _AnalyticsDashboardScreenState
     _SidebarItem(
       icon: Icons.manage_accounts_rounded,
       label: 'Supervisors Management',
+    ),
+        _SidebarItem(
+      icon: Icons.fingerprint_rounded,
+      label: 'Biometric Processing',
     ),
   ];
 
@@ -354,6 +358,9 @@ class _AnalyticsDashboardScreenState
         break;
       case 9:
         destination = const SupervisorManagementScreen();
+        break;
+      case 10:
+        destination = const BiometricProcessingScreen();
         break;
       default:
         return;

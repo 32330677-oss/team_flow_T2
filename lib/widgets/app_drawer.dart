@@ -10,7 +10,7 @@ import '../screens/hr_management_screen.dart';
 import '../screens/pending_transfers_screen.dart';
 import '../screens/staff_attendance_payroll_hub.dart';
 import '../screens/supervisor_management_screen.dart';
-
+import '../screens/biometric_processing_screen.dart';
 class AppDrawer extends StatelessWidget {
   const AppDrawer({super.key});
 
@@ -69,6 +69,8 @@ void _confirmLogout() {
       _DrawerItem(Icons.swap_horiz_rounded, 'Transfer Requests', (ctx) => _go(ctx, const PendingTransfersScreen())),
       _DrawerItem(Icons.badge_rounded, 'Staff Attendance & Payroll', (ctx) => _go(ctx, const StaffAttendancePayrollHub())),
       _DrawerItem(Icons.manage_accounts_rounded, 'Supervisors Management', (ctx) => _go(ctx, const SupervisorManagementScreen())),
+            _DrawerItem(Icons.fingerprint_rounded, 'Biometric Processing',
+          (ctx) => _go(ctx, const BiometricProcessingScreen())),
     ];
 
     return Drawer(

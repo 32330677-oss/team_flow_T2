@@ -15,6 +15,7 @@ import 'staff_attendance_payroll_hub.dart';
 import 'payroll_screen.dart';
 import 'admin_attendance_screen.dart';
 import 'biometric_import_screen.dart';
+import 'device_id_mapping_screen.dart';
 class DashColors {
   // Dark-mode surface colors: a deeper shade of the app's own navy brand
   // color instead of an unrelated tech-blue palette, so night mode still
@@ -103,6 +104,10 @@ class _AnalyticsDashboardScreenState
       icon: Icons.upload_file_rounded,
       label: 'Biometric Import',
     ),
+    _SidebarItem(
+  icon: Icons.link_rounded,
+  label: 'Device ID Mapping',
+),
   ];
 
   Color get _pageBg =>
@@ -369,6 +374,9 @@ class _AnalyticsDashboardScreenState
       case 11:
         destination = const BiometricImportScreen();
         break;
+        case 12:
+  destination = const DeviceIdMappingScreen();
+  break;
       default:
         return;
     }

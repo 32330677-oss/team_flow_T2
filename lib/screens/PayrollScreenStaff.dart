@@ -497,8 +497,9 @@ void _showBatchDetailsSheet(Map batch, List staff) {
                             const SizedBox(height: 16),
               const MonthlyReportCard(
                 title: 'Monthly Staff Hours & Payroll Report',
-                subtitle: 'Staff / employees only. Daily hours, totals and stored staff payroll values for the selected month.',
+                subtitle: 'Staff / employees only. Daily hours, totals and stored staff payroll values for the selected month or day range.',
                 endpoint: '/staff-payroll/monthly-report.xlsx',
+                pdfEndpoint: '/staff-payroll/monthly-report.pdf',
                 filePrefix: 'staff_hours_payroll',
               ),
               const SizedBox(height: 20),

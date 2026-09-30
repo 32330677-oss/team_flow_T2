@@ -668,8 +668,9 @@ Future<void> _exportBatchPdf(Map batch) async {
               const SizedBox(height: 16),
               const MonthlyReportCard(
                 title: 'Monthly Labor Hours & Payroll Report',
-                subtitle: 'Workers / laborers only. Daily hours, totals and stored payroll values for the selected month.',
+                subtitle: 'Workers / laborers only. Daily hours, totals and stored payroll values for the selected month or day range.',
                 endpoint: '/admin/payroll/monthly-report.xlsx',
+                pdfEndpoint: '/admin/payroll/monthly-report.pdf',
                 filePrefix: 'labor_hours_payroll',
               ),
               const SizedBox(height: 20),

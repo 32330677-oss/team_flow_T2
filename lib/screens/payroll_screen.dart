@@ -5,7 +5,7 @@ import 'package:dio/dio.dart';
 import 'package:intl/intl.dart';
 import 'payroll_export_service.dart';
 import '../widgets/custom_app_bar.dart';
-
+import '../widgets/monthly_report_card.dart';
 String formatSyp(dynamic value) {
   final amount = double.tryParse(value?.toString() ?? '0') ?? 0;
   return '${NumberFormat('#,##0', 'en_US').format(amount)} ل.س';
@@ -664,7 +664,14 @@ Future<void> _exportBatchPdf(Map batch) async {
             children: [
               _buildSiteFilterDropdown(),
               const SizedBox(height: 16),
-              _buildGenerateCard(),
+                            _buildGenerateCard(),
+              const SizedBox(height: 16),
+              const MonthlyReportCard(
+                title: 'Monthly Labor Hours & Payroll Report',
+                subtitle: 'Workers / laborers only. Daily hours, totals and stored payroll values for the selected month.',
+                endpoint: '/admin/payroll/monthly-report.xlsx',
+                filePrefix: 'labor_hours_payroll',
+              ),
               const SizedBox(height: 20),
               Row(
                 children: [

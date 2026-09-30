@@ -310,7 +310,7 @@ class _StaffAttendanceReviewScreenState extends State<StaffAttendanceReviewScree
       ),
     ),
 
-  if (!rejected)
+    if (!rejected && item['source'] != 'Biometric')
     TextButton.icon(
       onPressed: _working
           ? null

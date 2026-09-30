@@ -97,84 +97,85 @@ class _DeviceIdMappingScreenState
     }
   }
 
+    String _fmtDate(DateTime d) =>
+      '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+
+  // Default = first punch date, but never before the person's start date.
+  String _defaultEffective(UnmappedDevice d, AvailableBiometricPerson p) {
+    final first = (d.firstPunch != null && d.firstPunch!.length >= 10)
+        ? d.firstPunch!.substring(0, 10)
+        : _fmtDate(DateTime.now());
+    final start = p.startDate;
+    return (start != null && start.compareTo(first) > 0) ? start : first;
+  }
+
   Future<void> _mapDevice(UnmappedDevice device) async {
     final personId = _selectedPeople[device.deviceEmployeeId];
-
     if (personId == null) {
-      _snack(
-        'Please select a $_entityType first.',
-        Colors.orange.shade800,
-      );
+      _snack('Please select a $_entityType first.', Colors.orange.shade800);
       return;
     }
-
-    final person = _people.firstWhere(
-      (p) => p.id == personId,
-    );
+    final person = _people.firstWhere((p) => p.id == personId);
+    String effectiveFrom = _defaultEffective(device, person);
 
     final confirmed = await showDialog<bool>(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Confirm Device ID Mapping'),
-        content: Text(
-          'Map device employee ID "${device.deviceEmployeeId}" '
-          'to ${person.fullName}?\n\n'
-          'Type: $_entityType\n'
-          'Device punches: ${device.punches}',
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setD) => AlertDialog(
+          title: const Text('Confirm Device ID Mapping'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('Map device ID "${device.deviceEmployeeId}" to ${person.fullName}?\n'
+                  'Type: $_entityType • Punches: ${device.punches}'),
+              const SizedBox(height: 12),
+              OutlinedButton.icon(
+                icon: const Icon(Icons.event, size: 16),
+                label: Text('Effective from: $effectiveFrom'),
+                onPressed: () async {
+                  final picked = await showDatePicker(
+                    context: ctx,
+                    initialDate: DateTime.tryParse(effectiveFrom) ?? DateTime.now(),
+                    firstDate: DateTime(2020),
+                    lastDate: DateTime.now(),
+                  );
+                  if (picked != null) setD(() => effectiveFrom = _fmtDate(picked));
+                },
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Punches from this date onward will resolve to this person. '
+                'After mapping, run Biometric Processing to process the skipped punches.',
+                style: const TextStyle(fontSize: 11.5, color: AppColors.textSecondary),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+            FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Map')),
+          ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Map'),
-          ),
-        ],
       ),
     );
-
     if (confirmed != true) return;
 
     setState(() => _saving = true);
-
     try {
-      final today = DateTime.now();
-
-      final effectiveFrom =
-          '${today.year.toString().padLeft(4, '0')}-'
-          '${today.month.toString().padLeft(2, '0')}-'
-          '${today.day.toString().padLeft(2, '0')}';
-
       await _service.createMapping(
         deviceEmployeeId: device.deviceEmployeeId,
         entityType: _entityType,
         entityId: person.id,
         effectiveFrom: effectiveFrom,
       );
-
       if (!mounted) return;
-
-      _snack(
-        'Device ID ${device.deviceEmployeeId} mapped successfully.',
-        Colors.green.shade700,
-      );
-
+      _snack('Device ID ${device.deviceEmployeeId} mapped from $effectiveFrom.', Colors.green.shade700);
       await _load();
     } on BiometricApiException catch (e) {
       if (!mounted) return;
-
-      _snack(
-        e.message,
-        e.statusCode == 409
-            ? Colors.orange.shade800
-            : Colors.red,
-      );
+      _snack(e.message, e.statusCode == 409 ? Colors.orange.shade800 : Colors.red);
     } finally {
-      if (mounted) {
-        setState(() => _saving = false);
-      }
+      if (mounted) setState(() => _saving = false);
     }
   }
 

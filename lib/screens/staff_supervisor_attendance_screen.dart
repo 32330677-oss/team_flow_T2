@@ -33,7 +33,7 @@ class _StaffRow {
   TimeOfDay checkOut;
 
   bool existing;
-
+  bool checkOutPending;
   /// Workflow status coming from the server:
   /// null (no record yet) / Draft / Submitted / Approved / Rejected
   String? workflowStatus;
@@ -55,6 +55,7 @@ class _StaffRow {
     required this.checkIn,
     required this.checkOut,
     required this.existing,
+    this.checkOutPending = false,
     this.workflowStatus,
     this.rejectionNote,
   });
@@ -294,7 +295,11 @@ TimeOfDay _defaultCheckOutFor(double standardHours) {
        checkOut:
     _parseTime(raw['check_out_time']) ??
         _defaultCheckOutFor(standard),
-          existing: hasRecord,
+                  existing: hasRecord,
+          checkOutPending: hasRecord &&
+              raw['check_in_time'] != null &&
+              raw['check_out_time'] == null &&
+              raw['attendance_status']?.toString() == 'Present',
           workflowStatus:
               hasRecord
                   ? raw['status']?.toString()
@@ -311,12 +316,13 @@ TimeOfDay _defaultCheckOutFor(double standardHours) {
             !row.isLocked) {
           final old = oldById[row.staffId];
 
-          if (old != null) {
+                  if (old != null) {
             row.status = old.status;
             row.checkIn = old.checkIn;
             row.checkOut = old.checkOut;
             row.checkInDate = old.checkInDate;
             row.checkOutDate = old.checkOutDate;
+            row.checkOutPending = old.checkOutPending;
             row.lunchStart = old.lunchStart;
             row.lunchEnd = old.lunchEnd;
           }
@@ -390,6 +396,7 @@ TimeOfDay _defaultCheckOutFor(double standardHours) {
         row.checkInDate = picked;
       } else {
         row.checkOutDate = picked;
+        row.checkOutPending = false;
       }
     });
   }
@@ -575,8 +582,13 @@ TimeOfDay _defaultCheckOutFor(double standardHours) {
 
 Future<void> _saveAllAsDraft() async {
   if (_isSaving) return;
+
   final rows = _rows
-      .where((r) => !r.isLocked && r.workflowStatus != 'Rejected' && r.status != null)
+      .where((r) =>
+          !r.isLocked &&
+          r.workflowStatus != 'Rejected' &&
+          r.status != null &&
+          !(r.status == 'Present' && r.checkOutPending))
       .toList();
   if (rows.isEmpty) {
     _showSnack('  Nothing to save for this date.', Colors.orange);
@@ -612,6 +624,18 @@ Future<void> _submitAttendance() async {
     return;
   }
 
+  final pending = requiredRows
+      .where((r) => r.status == 'Present' && r.checkOutPending)
+      .toList();
+
+  if (pending.isNotEmpty) {
+    _showSnack(
+      'Missing check-out (wait for the biometric OUT or enter it manually): '
+      '${pending.map((r) => r.fullName).join(', ')}',
+      Colors.orange,
+    );
+    return;
+  }
 
   await _saveRows(
     requiredRows,
@@ -781,8 +805,11 @@ for (final r in rows) {
         if (row.status == 'Present') {
           map['check_in_time'] =
               _fmtDateTime(_combine(row.checkInDate, row.checkIn));
-          map['check_out_time'] =
-              _fmtDateTime(_resolveOut(row));
+
+          if (!row.checkOutPending) {
+            map['check_out_time'] =
+                _fmtDateTime(_resolveOut(row));
+          }
 
           if (row.lunchStart != null && row.lunchEnd != null) {
             map['lunch_start_time'] = _fmtDateTime(row.lunchStart!);
@@ -790,8 +817,7 @@ for (final r in rows) {
           }
 
           if (_isFridaySelected) {
-            map['friday_confirmed'] =
-                fridayConfirmed;
+            map['friday_confirmed'] = fridayConfirmed;
           }
         }
 
@@ -1276,7 +1302,13 @@ for (final r in rows) {
                         height: 4,
                       ),
                       _workflowBadge(row),
-                    ],
+                      if (row.checkOutPending) ...[
+                        const SizedBox(height: 4),
+                        _chip(
+                          'Waiting for check-out',
+                          Colors.orange.shade800,
+                        ),
+                      ],                    ],
                   ),
                 ),
          DropdownButton<String>(
@@ -1431,12 +1463,12 @@ for (final r in rows) {
                           minimumSize: Size.zero,
                         ),
                       ),
-                      _timeField(
+                                            _timeField(
                         row.checkOut,
-                        (v) => setState(
-                          () => row
-                              .checkOut = v,
-                        ),
+                        (v) => setState(() {
+                          row.checkOut = v;
+                          row.checkOutPending = false;
+                        }),
                       ),
                     ],
                   ),

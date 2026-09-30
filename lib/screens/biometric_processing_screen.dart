@@ -3,7 +3,7 @@ import 'package:intl/intl.dart';
 import '../services/biometric_processing_service.dart';
 import '../widgets/app_data_table.dart';
 import '../widgets/custom_app_bar.dart';
-
+import 'payroll_export_service.dart';
 class BiometricProcessingScreen extends StatefulWidget {
   const BiometricProcessingScreen({super.key});
 
@@ -25,10 +25,19 @@ class _BiometricProcessingScreenState extends State<BiometricProcessingScreen> {
   bool _processing = false;
   String? _loadError;
 
+
+  DateTime _attDate = DateTime.now();
+  List<Map<String, dynamic>> _attWorkers = [];
+  List<Map<String, dynamic>> _attStaff = [];
+  bool _attLoading = false;
+  bool _downloading = false;
+
+  String get _attDateStr => DateFormat('yyyy-MM-dd').format(_attDate);
   @override
   void initState() {
     super.initState();
     _load(); // read-only: never triggers processing
+        _loadAttendance();
   }
 
   Future<void> _load({bool showSpinner = true}) async {
@@ -71,12 +80,222 @@ class _BiometricProcessingScreenState extends State<BiometricProcessingScreen> {
         r.failed > 0 ? Colors.orange.shade800 : Colors.green.shade700,
       );
       await _load(showSpinner: false);
+            await _loadAttendance();
     } on BiometricApiException catch (e) {
       if (!mounted) return;
       _snack(e.message, e.statusCode == 409 ? Colors.orange.shade800 : Colors.red);
     } finally {
       if (mounted) setState(() => _processing = false);
     }
+  }
+  Future<void> _loadAttendance() async {
+    if (mounted) setState(() => _attLoading = true);
+    try {
+      final r = await _service.getBiometricAttendance(_attDateStr);
+      if (!mounted) return;
+      setState(() {
+        _attWorkers = r['workers']!;
+        _attStaff = r['staff']!;
+        _attLoading = false;
+      });
+    } on BiometricApiException catch (e) {
+      if (!mounted) return;
+      setState(() => _attLoading = false);
+      _snack(e.message, Colors.red);
+    }
+  }
+
+  Future<void> _pickAttDate() async {
+    final d = await showDatePicker(
+      context: context,
+      initialDate: _attDate,
+      firstDate: DateTime(2023),
+      lastDate: DateTime.now(),
+    );
+    if (d != null) {
+      setState(() => _attDate = d);
+      _loadAttendance();
+    }
+  }
+
+  Future<void> _downloadExcel() async {
+    setState(() => _downloading = true);
+    try {
+      final bytes = await _service.downloadDailyAttendance(_attDateStr);
+      await PayrollExportService.exportBytes(bytes, 'daily_attendance_$_attDateStr.xlsx');
+      _snack('Daily attendance report is ready.', Colors.green.shade700);
+    } on BiometricApiException catch (e) {
+      _snack(e.message, Colors.red);
+    } finally {
+      if (mounted) setState(() => _downloading = false);
+    }
+  }
+
+  Future<DateTime?> _pickDT(DateTime? initial) async {
+    final base = initial ?? _attDate;
+    final d = await showDatePicker(
+      context: context,
+      initialDate: base,
+      firstDate: DateTime(2023),
+      lastDate: DateTime.now().add(const Duration(days: 2)),
+    );
+    if (d == null || !mounted) return null;
+    final t = await showTimePicker(context: context, initialTime: TimeOfDay.fromDateTime(base));
+    if (t == null) return null;
+    return DateTime(d.year, d.month, d.day, t.hour, t.minute);
+  }
+
+  Future<void> _editTimes(Map<String, dynamic> row, bool isWorker) async {
+    DateTime? inDt = DateTime.tryParse('${row['check_in_time'] ?? ''}'.replaceFirst(' ', 'T'));
+    DateTime? outDt = DateTime.tryParse('${row['check_out_time'] ?? ''}'.replaceFirst(' ', 'T'));
+    final reason = TextEditingController();
+    final f = DateFormat('yyyy-MM-dd HH:mm');
+
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setD) => AlertDialog(
+          title: Text('Edit — ${row['full_name'] ?? ''}'),
+          content: Column(mainAxisSize: MainAxisSize.min, children: [
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Check-in'),
+              subtitle: Text(inDt == null ? 'Not set' : f.format(inDt!)),
+              trailing: const Icon(Icons.edit, size: 18),
+              onTap: () async {
+                final v = await _pickDT(inDt);
+                if (v != null) setD(() => inDt = v);
+              },
+            ),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Check-out'),
+              subtitle: Text(outDt == null ? 'Not set' : f.format(outDt!)),
+              trailing: const Icon(Icons.edit, size: 18),
+              onTap: () async {
+                final v = await _pickDT(outDt);
+                if (v != null) setD(() => outDt = v);
+              },
+            ),
+            TextField(
+              controller: reason,
+              maxLines: 2,
+              decoration: const InputDecoration(labelText: 'Reason *', border: OutlineInputBorder()),
+            ),
+          ]),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+            FilledButton(
+              onPressed: () {
+                if (reason.text.trim().isEmpty) return;
+                Navigator.pop(ctx, true);
+              },
+              child: const Text('Save'),
+            ),
+          ],
+        ),
+      ),
+    );
+    final reasonText = reason.text.trim();
+    reason.dispose();
+    if (ok != true) return;
+
+    final sf = DateFormat('yyyy-MM-dd HH:mm:ss');
+    try {
+      await _service.editBiometricTimes(
+        isWorker: isWorker,
+        id: int.parse('${row[isWorker ? 'attendance_id' : 'staff_attendance_id']}'),
+        checkIn: inDt == null ? null : sf.format(inDt!),
+        checkOut: outDt == null ? null : sf.format(outDt!),
+        reason: reasonText,
+      );
+      _snack('Times updated.', Colors.green.shade700);
+      await _loadAttendance();
+    } on BiometricApiException catch (e) {
+      _snack(e.message, Colors.red);
+    }
+  }
+
+  Widget _attRow(Map<String, dynamic> r, bool isWorker) {
+    String t(dynamic v) => v == null ? '--:--' : '$v'.replaceFirst('T', ' ').substring(11, 16);
+    final status = '${r['status']}';
+    final editable = status == 'Draft' || status == 'Submitted';
+    final hours = isWorker ? r['total_working_hours'] : r['regular_hours'];
+    final sub = isWorker
+        ? '${r['site_name'] ?? ''} • ${r['shift_type'] ?? ''}'
+        : '${r['position'] ?? 'Staff'}';
+    return ListTile(
+      dense: true,
+      leading: Icon(isWorker ? Icons.engineering_outlined : Icons.badge_outlined, color: AppColors.primary),
+      title: Text('${r['full_name'] ?? ''}', style: const TextStyle(fontWeight: FontWeight.w600)),
+      subtitle: Text('$sub\nIn ${t(r['check_in_time'])} → Out ${t(r['check_out_time'])} • ${hours ?? '--'}h '
+          '${(double.tryParse('${r['overtime_hours'] ?? 0}') ?? 0) > 0 ? '• OT ${r['overtime_hours']}h' : ''}'),
+      isThreeLine: true,
+      trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+        StatusBadge.fromStatus(status),
+        IconButton(
+          tooltip: editable ? 'Edit times' : 'Locked',
+          icon: const Icon(Icons.edit_rounded, size: 18),
+          onPressed: editable ? () => _editTimes(r, isWorker) : null,
+        ),
+      ]),
+    );
+  }
+
+  Widget _attendanceSection() {
+    final empty = _attWorkers.isEmpty && _attStaff.isEmpty;
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: AppColors.border),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Wrap(spacing: 10, runSpacing: 8, crossAxisAlignment: WrapCrossAlignment.center, children: [
+          const Text('Biometric Attendance', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+          OutlinedButton.icon(
+            onPressed: _pickAttDate,
+            icon: const Icon(Icons.calendar_today, size: 15),
+            label: Text(_attDateStr),
+          ),
+          FilledButton.icon(
+            onPressed: _downloading ? null : _downloadExcel,
+            style: FilledButton.styleFrom(backgroundColor: AppColors.primary),
+            icon: _downloading
+                ? const SizedBox(width: 15, height: 15,
+                    child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                : const Icon(Icons.table_view, size: 16),
+            label: const Text('Download Excel'),
+          ),
+        ]),
+        const SizedBox(height: 4),
+        const Text(
+          'Attendance created by biometric punches. Biometric records cannot be rejected — fix the times here, then the normal submit/approve flow continues. '
+          'The Excel file is the daily attendance report (workers).',
+          style: TextStyle(fontSize: 11.5, color: AppColors.textSecondary),
+        ),
+        const SizedBox(height: 8),
+        if (_attLoading)
+          const Padding(padding: EdgeInsets.all(16), child: Center(child: CircularProgressIndicator()))
+        else if (empty)
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 14),
+            child: Text('No biometric attendance for this date.',
+                style: TextStyle(color: AppColors.textSecondary)),
+          )
+        else ...[
+          if (_attWorkers.isNotEmpty) ...[
+            const Padding(padding: EdgeInsets.only(top: 6), child: Text('Workers', style: TextStyle(fontWeight: FontWeight.w700))),
+            ..._attWorkers.map((r) => _attRow(r, true)),
+          ],
+          if (_attStaff.isNotEmpty) ...[
+            const Padding(padding: EdgeInsets.only(top: 6), child: Text('Staff', style: TextStyle(fontWeight: FontWeight.w700))),
+            ..._attStaff.map((r) => _attRow(r, false)),
+          ],
+        ],
+      ]),
+    );
   }
 
   Future<void> _confirmRetryFailed() async {
@@ -145,6 +364,8 @@ class _BiometricProcessingScreenState extends State<BiometricProcessingScreen> {
                     _lastRunCard(),
                     const SizedBox(height: 14),
                     _issuesSection(),
+                                        const SizedBox(height: 14),
+                    _attendanceSection(),
                   ],
                 ],
               ),

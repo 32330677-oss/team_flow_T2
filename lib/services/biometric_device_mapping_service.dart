@@ -42,21 +42,18 @@ class AvailableBiometricPerson {
   final String fullName;
   final String? position;
 
-  const AvailableBiometricPerson({
-    required this.id,
-    required this.uniqueId,
-    required this.fullName,
-    this.position,
-  });
+  final String? startDate;
+  const AvailableBiometricPerson({required this.id, required this.uniqueId,
+      required this.fullName, this.position, this.startDate});
 
   factory AvailableBiometricPerson.fromJson(Map<String, dynamic> j) {
+    final sd = _str(j['start_date']);
     return AvailableBiometricPerson(
       id: _int(j['worker_id'] ?? j['staff_id']),
-      uniqueId: j['worker_unique_id']?.toString() ??
-          j['staff_unique_id']?.toString() ??
-          '',
+      uniqueId: j['worker_unique_id']?.toString() ?? j['staff_unique_id']?.toString() ?? '',
       fullName: j['full_name']?.toString() ?? '',
       position: _str(j['position']),
+      startDate: sd == null ? null : sd.substring(0, sd.length < 10 ? sd.length : 10),
     );
   }
 }

@@ -531,17 +531,23 @@ Future<void> _showManagementLeaveDialog(
                     label: const Text('Approve', style: TextStyle(fontSize: 12.5)),
                     style: TextButton.styleFrom(foregroundColor: Colors.green.shade700, padding: const EdgeInsets.symmetric(horizontal: 8)),
                   ),
-                TextButton.icon(
-                  onPressed: _working
-                      ? null
-                      : () async {
-                          final note = await _promptForReason(context);
-                          if (note != null) await _reviewSelected([id], 'Rejected', note: note);
-                        },
-                  icon: const Icon(Icons.close, size: 16),
-                  label: const Text('Reject', style: TextStyle(fontSize: 12.5)),
-                  style: TextButton.styleFrom(foregroundColor: Colors.red.shade700, padding: const EdgeInsets.symmetric(horizontal: 8)),
-                ),
+             if (item['source'] != 'Biometric')
+  TextButton.icon(
+    onPressed: _working
+        ? null
+        : () async {
+            final note = await _promptForReason(context);
+            if (note != null) {
+              await _reviewSelected([id], 'Rejected', note: note);
+            }
+          },
+    icon: const Icon(Icons.close, size: 16),
+    label: const Text('Reject', style: TextStyle(fontSize: 12.5)),
+    style: TextButton.styleFrom(
+      foregroundColor: Colors.red.shade700,
+      padding: const EdgeInsets.symmetric(horizontal: 8),
+    ),
+  ),
      IconButton(
   tooltip: 'Management leave',
   visualDensity: VisualDensity.compact,

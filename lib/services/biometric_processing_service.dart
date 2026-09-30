@@ -115,8 +115,20 @@ class BiometricIssue {
         return 'Device employee $deviceEmployeeId is not mapped to a worker/staff account for this date.';
       case 'no_assignment':
         return 'The mapped worker has no site assignment on the punch date.';
-      case 'outside_shift_window':
-        return 'The punch time is outside the worker\'s Night shift window.';
+      case 'future_punch':
+        return 'The punch date is in the future (check the device clock). It will be retried automatically.';
+      case 'punch_too_old':
+        return 'The punch is older than the allowed window (30 days) and will not be processed.';
+      case 'staff_inactive':
+        return 'The mapped staff member is not Active.';
+      case 'not_employed_on_date':
+        return 'The staff member was not employed on the punch date.';
+      case 'no_supervisor_assignment':
+        return 'The staff member has no Staff Supervisor assigned. Assign one, then retry.';
+      case 'open_break':
+        return 'The worker has an open break. End it, then retry.';
+      case 'conflict_review':
+        return 'Another attendance record conflicts with this punch. Needs review.';
       case 'no_open_attendance':
         return 'An OUT punch arrived but there is no attendance record to close.';
       case 'no_check_in':
@@ -175,7 +187,53 @@ class BiometricProcessingService {
       throw _map(e);
     }
   }
+  Future<Map<String, List<Map<String, dynamic>>>> getBiometricAttendance(String date) async {
+    try {
+      final r = await ApiConfig.dio.get('/biometric/attendance', queryParameters: {'date': date});
+      List<Map<String, dynamic>> l(dynamic v) =>
+          ((v as List?) ?? []).map((e) => Map<String, dynamic>.from(e as Map)).toList();
+      return {'workers': l(r.data['workers']), 'staff': l(r.data['staff'])};
+    } catch (e) {
+      throw _map(e);
+    }
+  }
 
+  Future<void> editBiometricTimes({
+    required bool isWorker,
+    required int id,
+    String? checkIn,
+    String? checkOut,
+    required String reason,
+  }) async {
+    try {
+      await ApiConfig.dio.patch('/biometric/attendance/${isWorker ? 'worker' : 'staff'}/$id', data: {
+        if (checkIn != null) 'check_in_time': checkIn,
+        if (checkOut != null) 'check_out_time': checkOut,
+        'reason': reason,
+      });
+    } catch (e) {
+      throw _map(e);
+    }
+  }
+
+  // Same export the Payroll screen uses.
+  Future<List<int>> downloadDailyAttendance(String date) async {
+    try {
+      final r = await ApiConfig.dio.get<List<int>>(
+        '/admin/payroll/daily-attendance/export.xlsx',
+        queryParameters: {'date': date},
+        options: Options(responseType: ResponseType.bytes, receiveTimeout: const Duration(seconds: 90)),
+      );
+      final bytes = r.data;
+      if (bytes == null || bytes.isEmpty) {
+        throw const BiometricApiException('Empty attendance report.');
+      }
+      return bytes;
+    } catch (e) {
+      if (e is BiometricApiException) rethrow;
+      throw _map(e);
+    }
+  }
   Future<BiometricRunSummary> processBiometricPunches({
     int limit = 200,
     bool? retrySkipped,

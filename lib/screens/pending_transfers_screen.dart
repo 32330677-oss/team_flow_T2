@@ -118,8 +118,8 @@ class _PendingTransfersScreenState extends State<PendingTransfersScreen> {
   /// Returns the chosen effective date (YYYY-MM-DD) or null when cancelled.
   Future<String?> _showApproveDialog({String? initialDate}) async {
     final today = DateTime.now();
+    // B3: future-dated transfers are allowed (the requested date is kept as is).
     var picked = DateTime.tryParse(initialDate ?? '') ?? today;
-    if (picked.isAfter(today)) picked = today;
     final result = await showDialog<bool>(
       context: context,
       builder: (ctx) => StatefulBuilder(
@@ -142,7 +142,7 @@ class _PendingTransfersScreenState extends State<PendingTransfersScreen> {
                     context: ctx,
                     initialDate: picked,
                     firstDate: DateTime(2023),
-                    lastDate: today,
+                    lastDate: today.add(const Duration(days: 365)),
                     helpText: 'Transfer effective date',
                   );
                   if (d != null) setD(() => picked = d);

@@ -574,14 +574,69 @@ Future<void> _submitBulkCompensation(void Function(void Function()) setModalStat
 
 
 
+  // D1: a status change is recorded in the worker status history with the
+  // date it takes effect, so historical attendance/biometric punches are
+  // resolved against the status that applied on their own date.
   Future<void> _toggleWorkerStatus(String workerUniqueId, String currentStatus) async {
     final newStatus = currentStatus == 'Active' ? 'Inactive' : 'Active';
+    DateTime effective = DateTime.now();
+    final reasonCtl = TextEditingController();
+    String fmt(DateTime d) =>
+        '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setD) => AlertDialog(
+          title: Text('Set $newStatus'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('From which date is the worker $newStatus?'),
+              const SizedBox(height: 10),
+              OutlinedButton.icon(
+                icon: const Icon(Icons.event, size: 16),
+                label: Text('Effective date: ${fmt(effective)}'),
+                onPressed: () async {
+                  final picked = await showDatePicker(
+                    context: ctx,
+                    initialDate: effective,
+                    firstDate: DateTime(2020),
+                    lastDate: DateTime.now(),
+                  );
+                  if (picked != null) setD(() => effective = picked);
+                },
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: reasonCtl,
+                decoration: const InputDecoration(labelText: 'Reason', border: OutlineInputBorder()),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+            FilledButton(onPressed: () => Navigator.pop(ctx, true), child: Text('Set $newStatus')),
+          ],
+        ),
+      ),
+    );
+    final reason = reasonCtl.text.trim();
+    reasonCtl.dispose();
+    if (confirmed != true) return;
     try {
-      final response = await ApiConfig.dio.put('/workers/$workerUniqueId', data: {'status': newStatus});
+      final response = await ApiConfig.dio.put('/workers/$workerUniqueId', data: {
+        'status': newStatus,
+        'status_effective_date': fmt(effective),
+        if (reason.isNotEmpty) 'status_reason': reason,
+      });
       if (response.statusCode == 200) {
         _fetchWorkers();
         _showSnackBar('Worker status updated to $newStatus', Colors.blue);
       }
+    } on DioException catch (e) {
+      final data = e.response?.data;
+      _showSnackBar(data is Map && data['message'] != null ? data['message'].toString() : 'Failed to update status', Colors.red);
     } catch (e) {
       _showSnackBar('Failed to update status', Colors.red);
     }

@@ -43,17 +43,28 @@ class AvailableBiometricPerson {
   final String? position;
 
   final String? startDate;
+
+  /// Only filled when the list was loaded with includeInactive (D5).
+  final String? status;
+  final String? terminationDate;
+
   const AvailableBiometricPerson({required this.id, required this.uniqueId,
-      required this.fullName, this.position, this.startDate});
+      required this.fullName, this.position, this.startDate, this.status,
+      this.terminationDate});
+
+  bool get isActive => status == null || status == 'Active';
 
   factory AvailableBiometricPerson.fromJson(Map<String, dynamic> j) {
     final sd = _str(j['start_date']);
+    final td = _str(j['termination_date']);
     return AvailableBiometricPerson(
       id: _int(j['worker_id'] ?? j['staff_id']),
       uniqueId: j['worker_unique_id']?.toString() ?? j['staff_unique_id']?.toString() ?? '',
       fullName: j['full_name']?.toString() ?? '',
       position: _str(j['position']),
       startDate: sd == null ? null : sd.substring(0, sd.length < 10 ? sd.length : 10),
+      status: _str(j['status']),
+      terminationDate: td == null ? null : td.substring(0, td.length < 10 ? td.length : 10),
     );
   }
 }
@@ -138,14 +149,18 @@ class BiometricDeviceMappingService {
     }
   }
 
+/// [includeInactive] (D5): every person, any status, for a CLOSED
+/// historical mapping (effective_to required).
 Future<List<AvailableBiometricPerson>> getAvailablePeople(
-  String entityType,
-) async {
+  String entityType, {
+  bool includeInactive = false,
+}) async {
   try {
     final r = await ApiConfig.dio.get(
       '/biometric/device-users/available',
       queryParameters: {
         'entity_type': entityType,
+        if (includeInactive) 'include_inactive': '1',
       },
     );
 
@@ -168,6 +183,7 @@ Future<List<AvailableBiometricPerson>> getAvailablePeople(
     required String entityType,
     required int entityId,
     required String effectiveFrom,
+    String? effectiveTo,
   }) async {
     try {
       await ApiConfig.dio.post(
@@ -180,6 +196,7 @@ Future<List<AvailableBiometricPerson>> getAvailablePeople(
           else
             'staff_id': entityId,
           'effective_from': effectiveFrom,
+          if (effectiveTo != null) 'effective_to': effectiveTo,
         },
       );
     } catch (e) {

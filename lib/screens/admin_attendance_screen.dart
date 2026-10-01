@@ -531,7 +531,9 @@ Future<void> _showManagementLeaveDialog(
                     label: const Text('Approve', style: TextStyle(fontSize: 12.5)),
                     style: TextButton.styleFrom(foregroundColor: Colors.green.shade700, padding: const EdgeInsets.symmetric(horizontal: 8)),
                   ),
-             if (item['source'] != 'Biometric')
+             // B6: biometric records can be rejected like manual ones; the
+             // supervisor corrects and resubmits them.
+             if (!rejected)
   TextButton.icon(
     onPressed: _working
         ? null

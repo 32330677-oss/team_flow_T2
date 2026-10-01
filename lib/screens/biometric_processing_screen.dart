@@ -3,9 +3,13 @@ import 'package:intl/intl.dart';
 import '../services/biometric_processing_service.dart';
 import '../widgets/app_data_table.dart';
 import '../widgets/custom_app_bar.dart';
+import 'biometric_daily_review_tab.dart';
 import 'payroll_export_service.dart';
+
 class BiometricProcessingScreen extends StatefulWidget {
-  const BiometricProcessingScreen({super.key});
+  /// 0 = Processing, 1 = Daily Review
+  final int initialTab;
+  const BiometricProcessingScreen({super.key, this.initialTab = 0});
 
   @override
   State<BiometricProcessingScreen> createState() => _BiometricProcessingScreenState();
@@ -18,13 +22,12 @@ class _BiometricProcessingScreenState extends State<BiometricProcessingScreen> {
 
   BiometricStatus? _status;
   List<BiometricIssue> _issues = [];
-  String? _filter; // null = all, 'Skipped', 'Failed'
+  String? _filter; // null = NeedsReview + Failed
   BiometricRunSummary? _lastRun;
 
   bool _loading = true;
   bool _processing = false;
   String? _loadError;
-
 
   DateTime _attDate = DateTime.now();
   List<Map<String, dynamic>> _attWorkers = [];
@@ -33,11 +36,12 @@ class _BiometricProcessingScreenState extends State<BiometricProcessingScreen> {
   bool _downloading = false;
 
   String get _attDateStr => DateFormat('yyyy-MM-dd').format(_attDate);
+
   @override
   void initState() {
     super.initState();
     _load(); // read-only: never triggers processing
-        _loadAttendance();
+    _loadAttendance();
   }
 
   Future<void> _load({bool showSpinner = true}) async {
@@ -63,24 +67,24 @@ class _BiometricProcessingScreenState extends State<BiometricProcessingScreen> {
     }
   }
 
-  Future<void> _run({bool? retrySkipped, bool? retryFailed}) async {
+  Future<void> _run({bool? retryFailed}) async {
     if (_processing) return;
     setState(() => _processing = true);
     try {
       final r = await _service.processBiometricPunches(
         limit: _limit,
-        retrySkipped: retrySkipped,
         retryFailed: retryFailed,
       );
       if (!mounted) return;
       setState(() => _lastRun = r);
       _snack(
         '${r.selected} punches selected — ${r.processed} processed, '
-        '${r.skipped} skipped, ${r.failed} failed.',
-        r.failed > 0 ? Colors.orange.shade800 : Colors.green.shade700,
+        '${r.needsReview} need review, ${r.skipped} informational, '
+        '${r.invalid} invalid, ${r.failed} failed.',
+        (r.failed > 0 || r.needsReview > 0) ? Colors.orange.shade800 : Colors.green.shade700,
       );
       await _load(showSpinner: false);
-            await _loadAttendance();
+      await _loadAttendance();
     } on BiometricApiException catch (e) {
       if (!mounted) return;
       _snack(e.message, e.statusCode == 409 ? Colors.orange.shade800 : Colors.red);
@@ -88,6 +92,7 @@ class _BiometricProcessingScreenState extends State<BiometricProcessingScreen> {
       if (mounted) setState(() => _processing = false);
     }
   }
+
   Future<void> _loadAttendance() async {
     if (mounted) setState(() => _attLoading = true);
     try {
@@ -131,89 +136,19 @@ class _BiometricProcessingScreenState extends State<BiometricProcessingScreen> {
     }
   }
 
-  Future<DateTime?> _pickDT(DateTime? initial) async {
-    final base = initial ?? _attDate;
-    final d = await showDatePicker(
-      context: context,
-      initialDate: base,
-      firstDate: DateTime(2023),
-      lastDate: DateTime.now().add(const Duration(days: 2)),
-    );
-    if (d == null || !mounted) return null;
-    final t = await showTimePicker(context: context, initialTime: TimeOfDay.fromDateTime(base));
-    if (t == null) return null;
-    return DateTime(d.year, d.month, d.day, t.hour, t.minute);
-  }
-
   Future<void> _editTimes(Map<String, dynamic> row, bool isWorker) async {
-    DateTime? inDt = DateTime.tryParse('${row['check_in_time'] ?? ''}'.replaceFirst(' ', 'T'));
-    DateTime? outDt = DateTime.tryParse('${row['check_out_time'] ?? ''}'.replaceFirst(' ', 'T'));
-    final reason = TextEditingController();
-    final f = DateFormat('yyyy-MM-dd HH:mm');
-
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setD) => AlertDialog(
-          title: Text('Edit — ${row['full_name'] ?? ''}'),
-          content: Column(mainAxisSize: MainAxisSize.min, children: [
-            ListTile(
-              contentPadding: EdgeInsets.zero,
-              title: const Text('Check-in'),
-              subtitle: Text(inDt == null ? 'Not set' : f.format(inDt!)),
-              trailing: const Icon(Icons.edit, size: 18),
-              onTap: () async {
-                final v = await _pickDT(inDt);
-                if (v != null) setD(() => inDt = v);
-              },
-            ),
-            ListTile(
-              contentPadding: EdgeInsets.zero,
-              title: const Text('Check-out'),
-              subtitle: Text(outDt == null ? 'Not set' : f.format(outDt!)),
-              trailing: const Icon(Icons.edit, size: 18),
-              onTap: () async {
-                final v = await _pickDT(outDt);
-                if (v != null) setD(() => outDt = v);
-              },
-            ),
-            TextField(
-              controller: reason,
-              maxLines: 2,
-              decoration: const InputDecoration(labelText: 'Reason *', border: OutlineInputBorder()),
-            ),
-          ]),
-          actions: [
-            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
-            FilledButton(
-              onPressed: () {
-                if (reason.text.trim().isEmpty) return;
-                Navigator.pop(ctx, true);
-              },
-              child: const Text('Save'),
-            ),
-          ],
-        ),
-      ),
+    final changed = await showBiometricEditTimesDialog(
+      context,
+      service: _service,
+      isWorker: isWorker,
+      recordId: int.parse('${row[isWorker ? 'attendance_id' : 'staff_attendance_id']}'),
+      fullName: '${row['full_name'] ?? ''}',
+      checkIn: row['check_in_time']?.toString(),
+      checkOut: row['check_out_time']?.toString(),
+      status: row['status']?.toString(),
+      fallbackDate: _attDate,
     );
-    final reasonText = reason.text.trim();
-    reason.dispose();
-    if (ok != true) return;
-
-    final sf = DateFormat('yyyy-MM-dd HH:mm:ss');
-    try {
-      await _service.editBiometricTimes(
-        isWorker: isWorker,
-        id: int.parse('${row[isWorker ? 'attendance_id' : 'staff_attendance_id']}'),
-        checkIn: inDt == null ? null : sf.format(inDt!),
-        checkOut: outDt == null ? null : sf.format(outDt!),
-        reason: reasonText,
-      );
-      _snack('Times updated.', Colors.green.shade700);
-      await _loadAttendance();
-    } on BiometricApiException catch (e) {
-      _snack(e.message, Colors.red);
-    }
+    if (changed) await _loadAttendance();
   }
 
   Widget _attRow(Map<String, dynamic> r, bool isWorker) {
@@ -224,11 +159,12 @@ class _BiometricProcessingScreenState extends State<BiometricProcessingScreen> {
     final sub = isWorker
         ? '${r['site_name'] ?? ''} • ${r['shift_type'] ?? ''}'
         : '${r['position'] ?? 'Staff'}';
+    final missingOut = r['check_in_time'] != null && r['check_out_time'] == null;
     return ListTile(
       dense: true,
       leading: Icon(isWorker ? Icons.engineering_outlined : Icons.badge_outlined, color: AppColors.primary),
       title: Text('${r['full_name'] ?? ''}', style: const TextStyle(fontWeight: FontWeight.w600)),
-      subtitle: Text('$sub\nIn ${t(r['check_in_time'])} → Out ${t(r['check_out_time'])} • ${hours ?? '--'}h '
+      subtitle: Text('$sub\nIn ${t(r['check_in_time'])} → Out ${missingOut ? 'missing' : t(r['check_out_time'])} • ${hours ?? '--'}h '
           '${(double.tryParse('${r['overtime_hours'] ?? 0}') ?? 0) > 0 ? '• OT ${r['overtime_hours']}h' : ''}'),
       isThreeLine: true,
       trailing: Row(mainAxisSize: MainAxisSize.min, children: [
@@ -271,7 +207,8 @@ class _BiometricProcessingScreenState extends State<BiometricProcessingScreen> {
         ]),
         const SizedBox(height: 4),
         const Text(
-          'Attendance created by biometric punches. Biometric records cannot be rejected — fix the times here, then the normal submit/approve flow continues. '
+          'Attendance created by biometric punches. Fix times here (a wrong check-out can be cleared). '
+          'Biometric records follow the normal submit / approve / reject flow. '
           'The Excel file is the daily attendance report (workers).',
           style: TextStyle(fontSize: 11.5, color: AppColors.textSecondary),
         ),
@@ -302,10 +239,11 @@ class _BiometricProcessingScreenState extends State<BiometricProcessingScreen> {
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Retry Failed punches?'),
+        title: const Text('Retry all Failed punches?'),
         content: const Text(
-          'This will re-process punches that previously failed, together with Pending and Skipped punches '
-          '(up to $_limit). Failed punches usually need investigation first.',
+          'Failed punches are retried automatically up to 3 times. This also re-processes '
+          'Failed punches that already reached that limit (up to $_limit, together with Pending ones). '
+          'Failed punches usually need investigation first.',
         ),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
@@ -313,10 +251,11 @@ class _BiometricProcessingScreenState extends State<BiometricProcessingScreen> {
         ],
       ),
     );
-    if (ok == true) await _run(retrySkipped: true, retryFailed: true);
+    if (ok == true) await _run(retryFailed: true);
   }
 
   void _snack(String msg, Color color) {
+    if (!mounted) return;
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
       ..showSnackBar(SnackBar(
@@ -330,46 +269,68 @@ class _BiometricProcessingScreenState extends State<BiometricProcessingScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.grey[100],
-      appBar: CustomAppBar(
-        title: 'Biometric Processing',
-        actions: [
-          IconButton(
-            tooltip: 'Refresh',
-            icon: const Icon(Icons.refresh),
-            onPressed: (_loading || _processing) ? null : () => _load(),
+    return DefaultTabController(
+      length: 2,
+      initialIndex: widget.initialTab.clamp(0, 1),
+      child: Scaffold(
+        backgroundColor: Colors.grey[100],
+        appBar: CustomAppBar(
+          title: 'Biometric Processing',
+          actions: [
+            IconButton(
+              tooltip: 'Refresh',
+              icon: const Icon(Icons.refresh),
+              onPressed: (_loading || _processing) ? null : () => _load(),
+            ),
+          ],
+          bottom: const TabBar(
+            labelColor: Colors.white,
+            unselectedLabelColor: Colors.white70,
+            indicatorColor: Colors.white,
+            tabs: [
+              Tab(icon: Icon(Icons.play_circle_outline), text: 'Processing'),
+              Tab(icon: Icon(Icons.fact_check_outlined), text: 'Daily Review'),
+            ],
           ),
+        ),
+        body: TabBarView(
+          children: [
+            _processingTab(),
+            const BiometricDailyReviewTab(),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _processingTab() {
+    if (_loading) return const Center(child: CircularProgressIndicator());
+    return RefreshIndicator(
+      onRefresh: () => _load(showSpinner: false),
+      child: ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        padding: const EdgeInsets.all(16),
+        children: [
+          const Text(
+            'Process imported biometric punches into attendance records. '
+            'Anything ambiguous is never guessed: it goes to the Daily Review tab.',
+            style: TextStyle(color: AppColors.textSecondary, fontSize: 13),
+          ),
+          const SizedBox(height: 14),
+          if (_loadError != null) _errorBox(_loadError!),
+          if (_status != null) ...[
+            _statusCards(_status!),
+            const SizedBox(height: 14),
+            _actionCard(_status!),
+            const SizedBox(height: 14),
+            _lastRunCard(),
+            const SizedBox(height: 14),
+            _issuesSection(),
+            const SizedBox(height: 14),
+            _attendanceSection(),
+          ],
         ],
       ),
-      body: _loading
-          ? const Center(child: CircularProgressIndicator())
-          : RefreshIndicator(
-              onRefresh: () => _load(showSpinner: false),
-              child: ListView(
-                physics: const AlwaysScrollableScrollPhysics(),
-                padding: const EdgeInsets.all(16),
-                children: [
-                  const Text(
-                    'Process imported biometric punches into attendance records.',
-                    style: TextStyle(color: AppColors.textSecondary, fontSize: 13),
-                  ),
-                  const SizedBox(height: 14),
-                  if (_loadError != null) _errorBox(_loadError!),
-                  if (_status != null) ...[
-                    _statusCards(_status!),
-                    const SizedBox(height: 14),
-                    _actionCard(_status!),
-                    const SizedBox(height: 14),
-                    _lastRunCard(),
-                    const SizedBox(height: 14),
-                    _issuesSection(),
-                                        const SizedBox(height: 14),
-                    _attendanceSection(),
-                  ],
-                ],
-              ),
-            ),
     );
   }
 
@@ -393,7 +354,7 @@ class _BiometricProcessingScreenState extends State<BiometricProcessingScreen> {
     return Tooltip(
       message: hint,
       child: Container(
-        width: 190,
+        width: 170,
         padding: const EdgeInsets.all(14),
         decoration: BoxDecoration(
           color: AppColors.surface,
@@ -417,20 +378,20 @@ class _BiometricProcessingScreenState extends State<BiometricProcessingScreen> {
   Widget _statusCards(BiometricStatus s) {
     return Wrap(spacing: 10, runSpacing: 10, children: [
       _statCard('Pending', s.pending, Colors.orange.shade800, 'Waiting to be processed.'),
-      _statCard('Processed', s.processed, Colors.green.shade700, 'Successfully handled.'),
-      _statCard('Skipped', s.skipped, Colors.blueGrey,
-          'Not processed because of a known condition. Can be retried.'),
-      _statCard('Failed', s.failed, AppColors.danger,
-          'Unexpected/explicit failure. Needs attention.'),
+      _statCard('Processed', s.processed, Colors.green.shade700, 'Changed attendance.'),
+      _statCard('Needs Review', s.needsReview, Colors.deepPurple, 'A person must decide (Daily Review).'),
+      _statCard('Failed', s.failed, AppColors.danger, 'Unexpected error. Auto-retried up to 3 times.'),
+      _statCard('Informational', s.skipped, Colors.blueGrey, 'Nothing to do (already applied / manual record exists).'),
+      _statCard('Invalid', s.invalid, Colors.brown, 'Future or too-old punch. Never processed.'),
+      _statCard('Dismissed', s.dismissed, Colors.grey.shade700, 'Closed by an admin with a note.'),
       _statCard('Total', s.total, AppColors.primary, 'All punches tracked.'),
     ]);
   }
 
   Widget _actionCard(BiometricStatus s) {
     String? diagnosis;
-    if (s.pending == 0 && s.skipped > 0) {
-      diagnosis = '${s.skipped} punches are currently skipped. Review the reasons below, '
-          'fix the underlying issue, then retry them.';
+    if (s.needsReview > 0) {
+      diagnosis = '${s.needsReview} punch(es) need a decision. Open the Daily Review tab.';
     } else if (s.pending == 0) {
       diagnosis = 'There are no pending biometric punches to process.';
     }
@@ -463,23 +424,17 @@ class _BiometricProcessingScreenState extends State<BiometricProcessingScreen> {
             label: Text(_processing ? 'Processing…' : 'Process Pending Punches'),
           ),
           OutlinedButton.icon(
-            onPressed: _processing || s.skipped == 0
-                ? null
-                : () => _run(retrySkipped: true, retryFailed: false),
-            icon: const Icon(Icons.replay),
-            label: const Text('Retry Skipped'),
-          ),
-          OutlinedButton.icon(
             onPressed: _processing || s.failed == 0 ? null : _confirmRetryFailed,
             style: OutlinedButton.styleFrom(foregroundColor: AppColors.danger),
             icon: const Icon(Icons.replay_circle_filled_outlined),
-            label: const Text('Retry Failed'),
+            label: const Text('Retry All Failed'),
           ),
         ]),
         const SizedBox(height: 10),
         const Text(
-          'Each run handles up to $_limit punches, oldest first. Process Pending Punches also '
-          'retries Skipped punches; it never retries Failed punches. Retrying Failed is always explicit.',
+          'Each run handles up to $_limit punches, oldest first, applied chronologically. '
+          'Failed punches are retried automatically up to 3 times; items that need review '
+          'are only handled from the Daily Review.',
           style: TextStyle(fontSize: 11.5, color: AppColors.textSecondary),
         ),
         if (diagnosis != null) ...[
@@ -505,22 +460,23 @@ class _BiometricProcessingScreenState extends State<BiometricProcessingScreen> {
         const SizedBox(height: 8),
         if (r == null)
           const Text(
-            'No run started from this screen yet. The server does not store run history; '
-            'per-punch outcomes appear in the table below.',
+            'No run started from this screen yet. Per-punch outcomes appear below and in the Daily Review.',
             style: TextStyle(fontSize: 12, color: AppColors.textSecondary),
           )
         else ...[
           Wrap(spacing: 8, runSpacing: 6, children: [
             _pill('Selected ${r.selected}', AppColors.primary),
             _pill('Processed ${r.processed}', Colors.green.shade700),
-            _pill('Skipped ${r.skipped}', Colors.blueGrey),
+            _pill('Needs review ${r.needsReview}', Colors.deepPurple),
+            _pill('Informational ${r.skipped}', Colors.blueGrey),
+            _pill('Invalid ${r.invalid}', Colors.brown),
             _pill('Failed ${r.failed}', AppColors.danger),
           ]),
           const SizedBox(height: 8),
           Text(
             'Requested ${DateFormat('yyyy-MM-dd HH:mm:ss').format(r.requestedAt)} • '
             'round-trip ${(r.roundTrip.inMilliseconds / 1000).toStringAsFixed(1)}s (measured on this device) • '
-            'retry skipped: ${r.retrySkipped ? 'yes' : 'no'} • retry failed: ${r.retryFailed ? 'yes' : 'no'}',
+            'retry all failed: ${r.retryFailed ? 'yes' : 'no'}',
             style: const TextStyle(fontSize: 11.5, color: AppColors.textSecondary),
           ),
         ],
@@ -539,9 +495,16 @@ class _BiometricProcessingScreenState extends State<BiometricProcessingScreen> {
       );
 
   Widget _issuesSection() {
-    final filters = <String?, String>{null: 'All', 'Skipped': 'Skipped', 'Failed': 'Failed'};
+    final filters = <String?, String>{
+      null: 'Open (Review + Failed)',
+      'NeedsReview': 'Needs Review',
+      'Failed': 'Failed',
+      'Invalid': 'Invalid',
+      'Skipped': 'Informational',
+      'Dismissed': 'Dismissed',
+    };
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      Wrap(spacing: 8, children: [
+      Wrap(spacing: 8, runSpacing: 6, children: [
         for (final e in filters.entries)
           ChoiceChip(
             label: Text(e.value),
@@ -556,19 +519,18 @@ class _BiometricProcessingScreenState extends State<BiometricProcessingScreen> {
       ]),
       const SizedBox(height: 10),
       AppDataTableCard(
-        title: 'Skipped & Failed Punches',
-        subtitle: 'Latest ${_issues.length} (max 100) • hover a result for its meaning',
+        title: 'Punch Outcomes',
+        subtitle: 'Latest ${_issues.length} (max 100) • act on them in the Daily Review tab',
         icon: Icons.report_problem_outlined,
         accentColor: AppColors.primary,
-        emptyMessage: 'No processing issues.',
+        emptyMessage: 'Nothing here.',
         columns: const [
           DataColumn(label: Text('  Punch ID')),
           DataColumn(label: Text('  Employee')),
           DataColumn(label: Text('  Punched At')),
           DataColumn(label: Text('  Type')),
           DataColumn(label: Text('  Status')),
-          DataColumn(label: Text('  Result')),
-          DataColumn(label: Text('  Error')),
+          DataColumn(label: Text('  Reason')),
           DataColumn(label: Text('  Attempts')),
           DataColumn(label: Text('  Last Attempt')),
         ],
@@ -577,30 +539,39 @@ class _BiometricProcessingScreenState extends State<BiometricProcessingScreen> {
     ]);
   }
 
+  Color _statusColor(String status) {
+    switch (status) {
+      case 'Failed':
+        return AppColors.danger;
+      case 'NeedsReview':
+        return Colors.deepPurple;
+      case 'Invalid':
+        return Colors.brown;
+      case 'Processed':
+        return Colors.green.shade700;
+      default:
+        return Colors.blueGrey;
+    }
+  }
+
   DataRow _row(BiometricIssue i) {
-    final failed = i.status == 'Failed';
-    final color = failed ? AppColors.danger : Colors.blueGrey;
+    final color = _statusColor(i.status);
     String cut(String s) => s.length > 19 ? s.substring(0, 19) : s;
     Widget pad(Widget w) => Padding(padding: const EdgeInsets.symmetric(horizontal: 8), child: w);
 
     return DataRow(cells: [
       DataCell(pad(Text('${i.punchId}'))),
       DataCell(pad(Text(i.deviceEmployeeId))),
-      DataCell(pad(Text(cut(i.punchedAt)))),
+      DataCell(pad(Text(cut(i.punchedAt).replaceFirst('T', ' ')))),
       DataCell(pad(Text(i.punchType))),
-      DataCell(pad(StatusBadge(label: i.status, color: color))),
+      DataCell(pad(StatusBadge(label: i.status == 'Skipped' ? 'Informational' : i.status, color: color))),
       DataCell(pad(Tooltip(
-        message: i.explanation,
+        message: i.error ?? i.explanation,
         child: SizedBox(
-          width: 230,
-          child: Text('${i.result ?? '-'}\n${i.explanation}',
+          width: 280,
+          child: Text('${i.result ?? '-'}\n${i.error ?? i.explanation}',
               style: const TextStyle(fontSize: 11.5), maxLines: 3, overflow: TextOverflow.ellipsis),
         ),
-      ))),
-      DataCell(pad(SizedBox(
-        width: 180,
-        child: Text(i.error ?? '-',
-            style: const TextStyle(fontSize: 11.5), maxLines: 3, overflow: TextOverflow.ellipsis),
       ))),
       DataCell(pad(Text('${i.attempts}'))),
       DataCell(pad(Text(
@@ -610,5 +581,140 @@ class _BiometricProcessingScreenState extends State<BiometricProcessingScreen> {
         style: const TextStyle(fontSize: 11.5),
       ))),
     ]);
+  }
+}
+
+/// Shared edit dialog for a biometric record (used by the Processing tab and
+/// the Daily Review "Enter Checkout" action). Returns true when saved.
+Future<bool> showBiometricEditTimesDialog(
+  BuildContext context, {
+  required BiometricProcessingService service,
+  required bool isWorker,
+  required int recordId,
+  required String fullName,
+  String? checkIn,
+  String? checkOut,
+  String? status,
+  required DateTime fallbackDate,
+}) async {
+  DateTime? inDt = DateTime.tryParse('${checkIn ?? ''}'.replaceFirst(' ', 'T'));
+  DateTime? outDt = DateTime.tryParse('${checkOut ?? ''}'.replaceFirst(' ', 'T'));
+  final originalOut = outDt;
+  bool clearOut = false;
+  final reason = TextEditingController();
+  final f = DateFormat('yyyy-MM-dd HH:mm');
+
+  Future<DateTime?> pickDT(BuildContext ctx, DateTime? initial) async {
+    final base = initial ?? fallbackDate;
+    final d = await showDatePicker(
+      context: ctx,
+      initialDate: base,
+      firstDate: DateTime(2023),
+      lastDate: DateTime.now().add(const Duration(days: 2)),
+    );
+    if (d == null || !ctx.mounted) return null;
+    final t = await showTimePicker(context: ctx, initialTime: TimeOfDay.fromDateTime(base));
+    if (t == null) return null;
+    return DateTime(d.year, d.month, d.day, t.hour, t.minute);
+  }
+
+  final ok = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, setD) => AlertDialog(
+        title: Text('Edit — $fullName'),
+        content: Column(mainAxisSize: MainAxisSize.min, children: [
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Check-in'),
+            subtitle: Text(inDt == null ? 'Not set' : f.format(inDt!)),
+            trailing: const Icon(Icons.edit, size: 18),
+            onTap: () async {
+              final v = await pickDT(ctx, inDt);
+              if (v != null) setD(() => inDt = v);
+            },
+          ),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Check-out'),
+            subtitle: Text(clearOut
+                ? 'Will be cleared'
+                : (outDt == null ? 'Missing — enter the real check-out' : f.format(outDt!))),
+            trailing: const Icon(Icons.edit, size: 18),
+            onTap: () async {
+              final v = await pickDT(ctx, outDt ?? inDt);
+              if (v != null) setD(() { outDt = v; clearOut = false; });
+            },
+          ),
+          if (originalOut != null && status == 'Draft')
+            CheckboxListTile(
+              contentPadding: EdgeInsets.zero,
+              value: clearOut,
+              onChanged: (v) => setD(() => clearOut = v ?? false),
+              title: const Text('Clear this check-out (it is wrong)'),
+              subtitle: const Text('The record goes back to "missing check-out". The raw punch is kept.',
+                  style: TextStyle(fontSize: 11)),
+            ),
+          TextField(
+            controller: reason,
+            maxLines: 2,
+            decoration: const InputDecoration(labelText: 'Reason *', border: OutlineInputBorder()),
+          ),
+        ]),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          FilledButton(
+            onPressed: () {
+              if (reason.text.trim().isEmpty) return;
+              Navigator.pop(ctx, true);
+            },
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    ),
+  );
+  final reasonText = reason.text.trim();
+  reason.dispose();
+  if (ok != true) return false;
+
+  final sf = DateFormat('yyyy-MM-dd HH:mm:ss');
+  // Unchanged values are sent back exactly as stored (seconds included).
+  String? fmt(DateTime? v, String? original) {
+    if (v == null) return null;
+    final orig = DateTime.tryParse('${original ?? ''}'.replaceFirst(' ', 'T'));
+    if (orig != null && orig.year == v.year && orig.month == v.month && orig.day == v.day &&
+        orig.hour == v.hour && orig.minute == v.minute) {
+      return original!.replaceFirst('T', ' ').substring(0, 19);
+    }
+    return sf.format(v);
+  }
+
+  try {
+    await service.editBiometricTimes(
+      isWorker: isWorker,
+      id: recordId,
+      checkIn: fmt(inDt, checkIn),
+      checkOut: clearOut ? null : fmt(outDt, checkOut),
+      clearCheckOut: clearOut,
+      reason: reasonText,
+    );
+    if (context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: const Text('Times updated.'),
+        backgroundColor: Colors.green.shade700,
+        behavior: SnackBarBehavior.floating,
+      ));
+    }
+    return true;
+  } on BiometricApiException catch (e) {
+    if (context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(e.message),
+        backgroundColor: Colors.red,
+        behavior: SnackBarBehavior.floating,
+      ));
+    }
+    return false;
   }
 }

@@ -20,6 +20,10 @@ class _DeviceIdMappingScreenState
 
   String _entityType = 'Worker';
 
+  /// D5: closed historical mapping mode (lists inactive/terminated people,
+  /// requires an end date). Open-ended mappings stay Active-only.
+  bool _historical = false;
+
   List<UnmappedDevice> _devices = [];
   List<AvailableBiometricPerson> _people = [];
 
@@ -46,7 +50,7 @@ class _DeviceIdMappingScreenState
     try {
       final results = await Future.wait([
         _service.getUnmappedDevices(),
-        _service.getAvailablePeople(_entityType),
+        _service.getAvailablePeople(_entityType, includeInactive: _historical),
       ]);
 
       if (!mounted) return;
@@ -78,7 +82,7 @@ class _DeviceIdMappingScreenState
 
     try {
       final people =
-          await _service.getAvailablePeople(type);
+          await _service.getAvailablePeople(type, includeInactive: _historical);
 
       if (!mounted) return;
 
@@ -117,6 +121,18 @@ class _DeviceIdMappingScreenState
     }
     final person = _people.firstWhere((p) => p.id == personId);
     String effectiveFrom = _defaultEffective(device, person);
+    // Closed mapping: default end = last punch date, never after a staff
+    // member's termination date.
+    String? effectiveTo;
+    if (_historical) {
+      final last = (device.lastPunch != null && device.lastPunch!.length >= 10)
+          ? device.lastPunch!.substring(0, 10)
+          : effectiveFrom;
+      final term = person.terminationDate;
+      var end = (term != null && term.compareTo(last) < 0) ? term : last;
+      if (end.compareTo(effectiveFrom) < 0) end = effectiveFrom;
+      effectiveTo = end;
+    }
 
     final confirmed = await showDialog<bool>(
       context: context,
@@ -143,10 +159,39 @@ class _DeviceIdMappingScreenState
                   if (picked != null) setD(() => effectiveFrom = _fmtDate(picked));
                 },
               ),
+              if (_historical) ...[
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  icon: const Icon(Icons.event_busy, size: 16),
+                  label: Text('Effective to: $effectiveTo'),
+                  onPressed: () async {
+                    final first = DateTime.tryParse(effectiveFrom) ?? DateTime(2020);
+                    var initial = DateTime.tryParse(effectiveTo ?? '') ?? DateTime.now();
+                    if (initial.isBefore(first)) initial = first;
+                    if (initial.isAfter(DateTime.now())) initial = DateTime.now();
+                    final picked = await showDatePicker(
+                      context: ctx,
+                      initialDate: initial,
+                      firstDate: first,
+                      lastDate: DateTime.now(),
+                    );
+                    if (picked != null) setD(() => effectiveTo = _fmtDate(picked));
+                  },
+                ),
+                if (person.terminationDate != null)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: Text('Termination date: ${person.terminationDate} (the end date cannot be later).',
+                        style: const TextStyle(fontSize: 11, color: AppColors.textSecondary)),
+                  ),
+              ],
               const SizedBox(height: 8),
               Text(
-                'Punches from this date onward will resolve to this person. '
-                'After mapping, run Biometric Processing to process the skipped punches.',
+                _historical
+                    ? 'Closed historical mapping: only punches between these dates resolve to this person. '
+                        'After mapping, open Biometric Processing → Daily Review and Retry the unmapped punches.'
+                    : 'Punches from this date onward will resolve to this person. '
+                        'After mapping, open Biometric Processing → Daily Review and Retry the unmapped punches.',
                 style: const TextStyle(fontSize: 11.5, color: AppColors.textSecondary),
               ),
             ],
@@ -167,9 +212,15 @@ class _DeviceIdMappingScreenState
         entityType: _entityType,
         entityId: person.id,
         effectiveFrom: effectiveFrom,
+        effectiveTo: _historical ? effectiveTo : null,
       );
       if (!mounted) return;
-      _snack('Device ID ${device.deviceEmployeeId} mapped from $effectiveFrom.', Colors.green.shade700);
+      _snack(
+        _historical
+            ? 'Device ID ${device.deviceEmployeeId} mapped from $effectiveFrom to $effectiveTo.'
+            : 'Device ID ${device.deviceEmployeeId} mapped from $effectiveFrom.',
+        Colors.green.shade700,
+      );
       await _load();
     } on BiometricApiException catch (e) {
       if (!mounted) return;
@@ -240,7 +291,26 @@ class _DeviceIdMappingScreenState
 
                   _typeSelector(),
 
-                  const SizedBox(height: 16),
+                  const SizedBox(height: 8),
+
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    value: _historical,
+                    onChanged: _saving
+                        ? null
+                        : (v) {
+                            setState(() => _historical = v);
+                            _load();
+                          },
+                    title: const Text('Historical (closed) mapping'),
+                    subtitle: const Text(
+                      'For people who are now inactive or terminated: lists everyone and requires an end date. '
+                      'Open-ended mappings always require an Active person.',
+                      style: TextStyle(fontSize: 11.5),
+                    ),
+                  ),
+
+                  const SizedBox(height: 8),
 
                   if (_error != null)
                     _errorBox(_error!),
@@ -370,7 +440,9 @@ class _DeviceIdMappingScreenState
     return AppDataTableCard(
       title: 'Unmapped Device IDs',
       subtitle:
-          'Select an active $_entityType for each device ID.',
+          _historical
+              ? 'Select a $_entityType (any status) for a closed historical mapping.'
+              : 'Select an active $_entityType for each device ID.',
       icon: Icons.fingerprint_rounded,
       accentColor: AppColors.primary,
       emptyMessage: 'No unmapped device IDs found.',
@@ -429,9 +501,10 @@ class _DeviceIdMappingScreenState
                     'Select $_entityType',
                   ),
                   items: _people.map((person) {
-                    final label = person.position == null
+                    final base = person.position == null
                         ? '${person.fullName} (${person.uniqueId})'
                         : '${person.fullName} • ${person.position}';
+                    final label = person.isActive ? base : '$base — ${person.status}';
 
                     return DropdownMenuItem<int>(
                       value: person.id,

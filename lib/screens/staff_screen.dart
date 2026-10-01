@@ -1067,8 +1067,74 @@ class _AddEditStaffSheetState
     super.dispose();
   }
 
+  // D3: when salary or standard hours change, ask from which date the new
+  // values apply (history keeps the old values for earlier dates).
+  Future<Map<String, String>?> _askCompensationChange() async {
+    DateTime effective = DateTime.now();
+    final reasonCtl = TextEditingController();
+    String fmt(DateTime d) =>
+        '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setD) => AlertDialog(
+          title: const Text('Salary / hours change'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('From which date do the new values apply? Earlier dates keep the old values.'),
+              const SizedBox(height: 10),
+              OutlinedButton.icon(
+                icon: const Icon(Icons.event, size: 16),
+                label: Text('Effective from: ${fmt(effective)}'),
+                onPressed: () async {
+                  final picked = await showDatePicker(
+                    context: ctx,
+                    initialDate: effective,
+                    firstDate: DateTime(2020),
+                    lastDate: DateTime.now(),
+                  );
+                  if (picked != null) setD(() => effective = picked);
+                },
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: reasonCtl,
+                decoration: const InputDecoration(labelText: 'Reason', border: OutlineInputBorder()),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+            FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Continue')),
+          ],
+        ),
+      ),
+    );
+    final reason = reasonCtl.text.trim();
+    reasonCtl.dispose();
+    if (ok != true) return null;
+    return {
+      'compensation_effective_from': fmt(effective),
+      if (reason.isNotEmpty) 'compensation_reason': reason,
+    };
+  }
+
   Future<void> _submit() async {
     if (!_formKey.currentState!.validate()) return;
+
+    Map<String, String>? compensationChange;
+    if (widget.staff != null) {
+      final oldSalary = double.tryParse('${widget.staff?['monthly_salary'] ?? ''}');
+      final oldHours = double.tryParse('${widget.staff?['standard_daily_hours'] ?? ''}');
+      final newSalary = double.tryParse(_salaryController.text.trim());
+      final newHours = double.tryParse(_dailyHoursController.text.trim()) ?? 8.00;
+      if (oldSalary != newSalary || oldHours != newHours) {
+        compensationChange = await _askCompensationChange();
+        if (compensationChange == null) return;
+      }
+    }
 
     setState(() {
       _isSubmitting = true;
@@ -1100,6 +1166,7 @@ class _AddEditStaffSheetState
                   _dailyHoursController.text.trim(),
                 ) ??
                 8.00,
+        if (compensationChange != null) ...compensationChange,
       };
 
       if (isEditing) {

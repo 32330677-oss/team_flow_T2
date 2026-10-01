@@ -27,6 +27,22 @@ class _TransferRequestScreenState extends State<TransferRequestScreen> {
   Map<String, dynamic>? _selectedTargetSite;
 String? _selectedCurrentShiftType;
 String? _selectedTargetShiftType;
+  // B3: the business date the transfer should take effect (default today).
+  DateTime _effectiveDate = DateTime.now();
+
+  String get _effectiveDateStr =>
+      '${_effectiveDate.year.toString().padLeft(4, '0')}-${_effectiveDate.month.toString().padLeft(2, '0')}-${_effectiveDate.day.toString().padLeft(2, '0')}';
+
+  Future<void> _pickEffectiveDate() async {
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: _effectiveDate,
+      firstDate: DateTime.now().subtract(const Duration(days: 60)),
+      lastDate: DateTime.now().add(const Duration(days: 60)),
+      helpText: 'Transfer effective date',
+    );
+    if (picked != null) setState(() => _effectiveDate = picked);
+  }
   @override
   void initState() {
     super.initState();
@@ -283,6 +299,7 @@ if (_selectedWorker == null ||
   'current_shift_type': _selectedCurrentShiftType,
   'target_site_id': _selectedTargetSite!['site_id'],
   'target_shift_type': _selectedTargetShiftType,
+  'effective_date': _effectiveDateStr,
 });
 
     if (!mounted) return;
@@ -437,6 +454,13 @@ _buildSelector(
   icon: Icons.schedule,
   value: _selectedTargetShiftType,
   onTap: _pickTargetShift,
+),
+const SizedBox(height: 16),
+_buildSelector(
+  label: 'Effective Date (first day at the new site)',
+  icon: Icons.event,
+  value: _effectiveDateStr,
+  onTap: _pickEffectiveDate,
 ),
 const SizedBox(height: 28),
                   ElevatedButton.icon(

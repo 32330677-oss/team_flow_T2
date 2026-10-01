@@ -40,6 +40,22 @@ class _StaffRow {
 
   String? rejectionNote;
 
+  /// 'Manual' / 'Biometric' (null when there is no record yet).
+  final String? source;
+
+  /// Exact values stored on the server ('YYYY-MM-DD HH:MM:SS', seconds kept).
+  /// Unedited times are sent back exactly as stored (#2).
+  final String? origCheckIn;
+  final String? origCheckOut;
+
+  /// #2: only rows the supervisor actually changed are sent on Save Draft.
+  bool dirty = false;
+  bool checkInEdited = false;
+  bool checkOutEdited = false;
+
+  bool get isBiometric => source == 'Biometric';
+  bool get hasBiometricIn => isBiometric && origCheckIn != null;
+
   _StaffRow({
     required this.staffId,
     required this.uniqueId,
@@ -58,6 +74,9 @@ class _StaffRow {
     this.checkOutPending = false,
     this.workflowStatus,
     this.rejectionNote,
+    this.source,
+    this.origCheckIn,
+    this.origCheckOut,
   });
 
   /// Submitted is already in the admin queue; Approved is final.
@@ -243,6 +262,13 @@ TimeOfDay _defaultCheckOutFor(double standardHours) {
         for (final r in _rows) r.staffId: r,
       };
 
+      String? exact(dynamic v) {
+        final t = v?.toString();
+        if (t == null || t.isEmpty || t == 'null') return null;
+        final n = t.replaceFirst('T', ' ');
+        return n.length >= 19 ? n.substring(0, 19) : n;
+      }
+
       final newRows = data.map<_StaffRow>((raw) {
         final standard =
             (double.tryParse(raw['standard_minutes_snapshot']?.toString() ?? '') ?? 0) > 0
@@ -308,6 +334,9 @@ TimeOfDay _defaultCheckOutFor(double standardHours) {
               (note != null && note.trim().isNotEmpty)
                   ? note
                   : null,
+          source: hasRecord ? raw['source']?.toString() : null,
+          origCheckIn: exact(raw['check_in_time']),
+          origCheckOut: exact(raw['check_out_time']),
         );
 
         // Keep unsaved local edits of rows that were not part of this save.
@@ -325,6 +354,9 @@ TimeOfDay _defaultCheckOutFor(double standardHours) {
             row.checkOutPending = old.checkOutPending;
             row.lunchStart = old.lunchStart;
             row.lunchEnd = old.lunchEnd;
+            row.dirty = old.dirty;
+            row.checkInEdited = old.checkInEdited;
+            row.checkOutEdited = old.checkOutEdited;
           }
         }
 
@@ -391,12 +423,16 @@ TimeOfDay _defaultCheckOutFor(double standardHours) {
       helpText: checkIn ? 'Select check-in date' : 'Select check-out date',
     );
     if (picked == null || !mounted) return;
+    // B5: picking a DATE never clears a missing check-out by itself; only an
+    // explicit check-out TIME does.
     setState(() {
+      row.dirty = true;
       if (checkIn) {
         row.checkInDate = picked;
+        row.checkInEdited = true;
       } else {
         row.checkOutDate = picked;
-        row.checkOutPending = false;
+        if (!row.checkOutPending) row.checkOutEdited = true;
       }
     });
   }
@@ -446,6 +482,7 @@ TimeOfDay _defaultCheckOutFor(double standardHours) {
     );
     if (value == null || !mounted) return;
     setState(() {
+      row.dirty = true;
       if (start) {
         row.lunchStart = value;
       } else {
@@ -483,12 +520,18 @@ TimeOfDay _defaultCheckOutFor(double standardHours) {
       return;
     }
 
-    final applicable = _eligibleSelectedPresentRows();
-    final skippedCount = totalSelected - applicable.length;
+    // B5: rows that already have a biometric check-in are never overwritten
+    // by the bulk preset (edit them one by one if really needed).
+    final present = _eligibleSelectedPresentRows();
+    final applicable = present.where((r) => !r.hasBiometricIn).toList();
+    final biometricSkipped = present.length - applicable.length;
+    final skippedCount = totalSelected - present.length;
 
     if (applicable.isEmpty) {
       _showSnack(
-        'None of the checked employees are marked Present — Bulk Check-In only applies to Present employees.',
+        biometricSkipped > 0
+            ? 'All checked Present employees already have a biometric check-in — nothing to change.'
+            : 'None of the checked employees are marked Present — Bulk Check-In only applies to Present employees.',
         Colors.orange,
       );
       return;
@@ -498,18 +541,21 @@ TimeOfDay _defaultCheckOutFor(double standardHours) {
       for (final row in applicable) {
         row.checkIn = _globalCheckIn;
         row.checkInDate = _globalCheckInDate;
+        row.checkInEdited = true;
+        row.dirty = true;
       }
     });
 
     _showSnack(
-      skippedCount > 0
-          ? 'Check-in applied to ${applicable.length} employee(s). $skippedCount skipped (not Present).'
-          : 'Check-in applied to ${applicable.length} employee(s). Remember to Save Draft or Submit.',
+      'Check-in applied to ${applicable.length} employee(s).'
+      '${biometricSkipped > 0 ? ' $biometricSkipped kept their biometric check-in.' : ''}'
+      '${skippedCount > 0 ? ' $skippedCount skipped (not Present).' : ''}'
+      ' Remember to Save Draft or Submit.',
       Colors.blue.shade700,
     );
   }
 
-  void _applyBulkCheckOut() {
+  Future<void> _applyBulkCheckOut() async {
     final totalSelected = _selectedNotLockedCount();
     if (totalSelected == 0) {
       _showSnack('Check at least one employee first.', Colors.orange);
@@ -527,10 +573,34 @@ TimeOfDay _defaultCheckOutFor(double standardHours) {
       return;
     }
 
+    // B5: Bulk Check-Out is an explicit supervisor decision, so it also
+    // fills rows that were waiting for their check-out.
+    final waiting = applicable.where((r) => r.checkOutPending).length;
+    if (waiting > 0) {
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Enter check-out'),
+          content: Text(
+            '$waiting of the checked employees have no check-out yet (waiting for the biometric OUT). '
+            'Set their check-out to ${_fmtTime(_globalCheckOut)}?',
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+            FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Set check-out')),
+          ],
+        ),
+      );
+      if (ok != true || !mounted) return;
+    }
+
     setState(() {
       for (final row in applicable) {
         row.checkOut = _globalCheckOut;
         row.checkOutDate = _globalCheckOutDate;
+        row.checkOutPending = false;
+        row.checkOutEdited = true;
+        row.dirty = true;
       }
     });
 
@@ -569,6 +639,7 @@ TimeOfDay _defaultCheckOutFor(double standardHours) {
       for (final row in applicable) {
         row.lunchStart = _globalLunchStart;
         row.lunchEnd = _globalLunchEnd;
+        row.dirty = true;
       }
     });
 
@@ -583,15 +654,19 @@ TimeOfDay _defaultCheckOutFor(double standardHours) {
 Future<void> _saveAllAsDraft() async {
   if (_isSaving) return;
 
+  // #2: only rows the supervisor actually changed are sent. Untouched
+  // (e.g. biometric) rows are never re-saved, so their times stay exact.
+  // A biometric row still waiting for its OUT may be saved IN-only (#3).
   final rows = _rows
       .where((r) =>
+          r.dirty &&
           !r.isLocked &&
           r.workflowStatus != 'Rejected' &&
           r.status != null &&
-          !(r.status == 'Present' && r.checkOutPending))
+          !(r.status == 'Present' && r.checkOutPending && !r.hasBiometricIn))
       .toList();
   if (rows.isEmpty) {
-    _showSnack('  Nothing to save for this date.', Colors.orange);
+    _showSnack('No changes to save for this date.', Colors.orange);
     return;
   }
   await _saveRows(rows, mode: 'draft');
@@ -637,8 +712,10 @@ Future<void> _submitAttendance() async {
     return;
   }
 
+  // #2: unchanged rows are not re-sent; the backend promotes the existing
+  // Drafts of this date and validates every staff member.
   await _saveRows(
-    requiredRows,
+    requiredRows.where((r) => r.dirty || !r.existing).toList(),
     mode: 'submit',
     submitDay: true,
   );
@@ -803,12 +880,16 @@ for (final r in rows) {
         };
 
         if (row.status == 'Present') {
-          map['check_in_time'] =
-              _fmtDateTime(_combine(row.checkInDate, row.checkIn));
+          // #2: an unedited stored time is sent back exactly (seconds kept).
+          map['check_in_time'] = (!row.checkInEdited && row.origCheckIn != null)
+              ? row.origCheckIn
+              : _fmtDateTime(_combine(row.checkInDate, row.checkIn));
 
+          // B5: a missing check-out is never invented.
           if (!row.checkOutPending) {
-            map['check_out_time'] =
-                _fmtDateTime(_resolveOut(row));
+            map['check_out_time'] = (!row.checkOutEdited && row.origCheckOut != null)
+                ? row.origCheckOut
+                : _fmtDateTime(_resolveOut(row));
           }
 
           if (row.lunchStart != null && row.lunchEnd != null) {
@@ -1193,8 +1274,10 @@ for (final r in rows) {
                               ..clear()
                               ..addAll(selectableIds);
                             for (final row in _rows) {
-                              if (selectableIds.contains(row.staffId)) {
-                                row.status ??= 'Present';
+                              if (selectableIds.contains(row.staffId) &&
+                                  row.status == null) {
+                                row.status = 'Present';
+                                row.dirty = true;
                               }
                             }
                           }
@@ -1270,7 +1353,10 @@ for (final r in rows) {
                               // Checking a staff member with no status yet
                               // defaults it to Present — never overwrites
                               // an already-chosen status (e.g. Absent).
-                              row.status ??= 'Present';
+                              if (row.status == null) {
+                                row.status = 'Present';
+                                row.dirty = true;
+                              }
                             } else {
                               _selectedStaffIds.remove(row.staffId);
                             }
@@ -1301,14 +1387,20 @@ for (final r in rows) {
                       const SizedBox(
                         height: 4,
                       ),
-                      _workflowBadge(row),
-                      if (row.checkOutPending) ...[
-                        const SizedBox(height: 4),
-                        _chip(
-                          'Waiting for check-out',
-                          Colors.orange.shade800,
-                        ),
-                      ],                    ],
+                      Wrap(
+                        spacing: 6,
+                        runSpacing: 4,
+                        children: [
+                          _workflowBadge(row),
+                          if (row.isBiometric)
+                            _chip('Biometric', Colors.indigo),
+                          if (row.checkOutPending)
+                            _chip('Check-out missing', Colors.orange.shade800),
+                          if (row.dirty && !row.isLocked)
+                            _chip('Unsaved change', Colors.teal.shade700),
+                        ],
+                      ),
+                    ],
                   ),
                 ),
          DropdownButton<String>(
@@ -1323,11 +1415,12 @@ for (final r in rows) {
       .toList(),
   onChanged: locked
       ? null
-      : (v) => setState(
-            () => row.status =
-                v ??
-                    row.status,
-          ),
+      : (v) => setState(() {
+            if (v != null && v != row.status) {
+              row.status = v;
+              row.dirty = true;
+            }
+          }),
 ),
                 IconButton(
                   tooltip: row.workflowStatus == 'Rejected'
@@ -1384,11 +1477,8 @@ for (final r in rows) {
             if (locked) ...[
               const SizedBox(height: 6),
               Text(
-                row.status == 'Present'
-                    ? 'Approved by admin — locked '
-                        '(${_fmtTime(row.checkIn)} → ${_fmtTime(row.checkOut)})'
-                    : 'Approved by admin — locked '
-                        '(${row.status})',
+                '${row.workflowStatus == 'Submitted' ? 'Submitted — waiting for admin review' : (row.workflowStatus == 'Approved' ? 'Approved by admin — locked' : 'Inactive staff — view only')} '
+                '${row.status == 'Present' ? '(${_fmtTime(row.checkIn)} → ${row.checkOutPending ? 'check-out missing' : _fmtTime(row.checkOut)})' : '(${row.status ?? '-'})'}',
                 style: TextStyle(
                   fontSize: 11,
                   color:
@@ -1433,10 +1523,11 @@ for (final r in rows) {
                       ),
                       _timeField(
                         row.checkIn,
-                        (v) => setState(
-                          () => row
-                              .checkIn = v,
-                        ),
+                        (v) => setState(() {
+                          row.checkIn = v;
+                          row.checkInEdited = true;
+                          row.dirty = true;
+                        }),
                       ),
                     ],
                   ),
@@ -1463,18 +1554,43 @@ for (final r in rows) {
                           minimumSize: Size.zero,
                         ),
                       ),
-                                            _timeField(
-                        row.checkOut,
-                        (v) => setState(() {
-                          row.checkOut = v;
-                          row.checkOutPending = false;
-                        }),
-                      ),
+                      row.checkOutPending
+                          ? OutlinedButton.icon(
+                              // B5: the missing OUT is shown as missing; it is
+                              // only filled by an explicit time choice.
+                              onPressed: () async {
+                                final picked = await showTimePicker(
+                                  context: context,
+                                  initialTime: row.checkOut,
+                                  helpText: 'Enter the real check-out time',
+                                );
+                                if (picked != null && mounted) {
+                                  setState(() {
+                                    row.checkOut = picked;
+                                    row.checkOutPending = false;
+                                    row.checkOutEdited = true;
+                                    row.dirty = true;
+                                  });
+                                }
+                              },
+                              icon: Icon(Icons.timer_off_outlined, size: 16, color: Colors.orange.shade800),
+                              label: Text('— enter check-out',
+                                  style: TextStyle(color: Colors.orange.shade800)),
+                            )
+                          : _timeField(
+                              row.checkOut,
+                              (v) => setState(() {
+                                row.checkOut = v;
+                                row.checkOutPending = false;
+                                row.checkOutEdited = true;
+                                row.dirty = true;
+                              }),
+                            ),
                     ],
                   ),
                 ],
               ),
-              if (isOvernight)
+              if (isOvernight && !row.checkOutPending)
                 Padding(
                   padding:
                       const EdgeInsets.only(
@@ -1538,6 +1654,7 @@ for (final r in rows) {
                     onPressed: () => setState(() {
                       row.lunchStart = null;
                       row.lunchEnd = null;
+                      row.dirty = true;
                     }),
                     child: const Text('Clear lunch'),
                   ),

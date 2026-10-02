@@ -81,7 +81,18 @@ String explainBiometricResult(String? result, {String deviceEmployeeId = ''}) {
     case 'future_punch':
       return 'The punch date is in the future (check the device clock).';
     case 'punch_too_old':
-      return 'The punch is older than the allowed window and will not be processed.';
+      return 'The punch is older than the allowed window (counted from the punch time). '
+          'An Admin can restore it for processing with a reason.';
+    case 'long_duration':
+      return 'The session would be unusually long (above the review threshold). It is NOT closed automatically: '
+          'check for a forgotten check-out, then use it as check-out, enter the correct time, or mark it duplicate.';
+    case 'payroll_period_finalized':
+      return 'The punch date is inside a finalized or paid payroll period. Attendance there is locked; '
+          'use the Admin correction workflow if a change is really needed.';
+    case 'restored_for_processing':
+      return 'Restored by an Admin for processing (window override).';
+    case 'requeued':
+      return 'Re-queued with the current employee mapping.';
     case 'recovered_orphan':
       return 'Raw punch recovered by the migration. Retry to process it, or dismiss it.';
     case 'marked_duplicate':
@@ -121,6 +132,10 @@ String biometricActionLabel(String action) {
       return 'Dismiss';
     case 'review_later':
       return 'Review Later';
+    case 'restore_for_processing':
+      return 'Restore for processing';
+    case 'requeue':
+      return 'Re-queue with current mapping';
     default:
       return action;
   }
@@ -610,6 +625,23 @@ class BiometricProcessingService {
 
   Future<String> requeueItem(int punchId, String reason) =>
       _action('$_base/items/$punchId/requeue', {'reason': reason});
+
+  /// D-04: an Invalid (too old) punch can be restored with a reason; it is
+  /// then processed normally on the next run. Nothing is deleted.
+  Future<String> restoreItem(int punchId, String reason) =>
+      _action('$_base/items/$punchId/restore', {'reason': reason});
+
+  /// Processing history (every attempt and admin decision) for one punch.
+  Future<List<Map<String, dynamic>>> getItemHistory(int punchId) async {
+    try {
+      final r = await ApiConfig.dio.get('$_base/items/$punchId/history');
+      final data = r.data is Map ? r.data['data'] : null;
+      final list = data is Map ? (data['history'] ?? data['log'] ?? []) : (data ?? []);
+      return (list as List).map((e) => Map<String, dynamic>.from(e as Map)).toList();
+    } catch (e) {
+      throw _map(e);
+    }
+  }
 
   Future<String> closeStaleBatch(int batchId, String reason) =>
       _action('$_base/batches/$batchId/close', {'reason': reason});

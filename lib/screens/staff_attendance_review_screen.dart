@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:dio/dio.dart';
 import '../constants.dart';
 import '../widgets/custom_app_bar.dart';
+import '../widgets/help_tip.dart';
 
 class StaffAttendanceReviewScreen extends StatefulWidget {
   const StaffAttendanceReviewScreen({super.key});
@@ -78,20 +79,115 @@ class _StaffAttendanceReviewScreenState extends State<StaffAttendanceReviewScree
         .toList();
   }
 
+  Map<String, dynamic>? _itemById(int id) {
+    for (final list in _grouped.values) {
+      for (final item in list) {
+        if ('${item['staff_attendance_id']}' == '$id') return item;
+      }
+    }
+    return null;
+  }
+
+  bool _hasOpenAnomaly(Map<String, dynamic>? i) =>
+      i != null && i['anomaly_code'] != null && i['anomaly_ack_at'] == null;
+
+  Future<String?> _askText(String title, String message, String label, {int minLen = 5}) async {
+    final ctrl = TextEditingController();
+    String? err;
+    final r = await showDialog<String>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setD) => AlertDialog(
+          title: Text(title),
+          content: SizedBox(
+            width: 460,
+            child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(message),
+              const SizedBox(height: 12),
+              TextField(
+                controller: ctrl,
+                maxLines: 2,
+                decoration: InputDecoration(labelText: label, errorText: err, border: const OutlineInputBorder()),
+              ),
+            ]),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+            FilledButton(
+              onPressed: () {
+                if (ctrl.text.trim().length < minLen) {
+                  setD(() => err = 'Min. $minLen characters');
+                  return;
+                }
+                Navigator.pop(ctx, ctrl.text.trim());
+              },
+              child: const Text('Confirm'),
+            ),
+          ],
+        ),
+      ),
+    );
+    ctrl.dispose();
+    return r;
+  }
+
+  /// D-11: Sick / Vacation / Holiday is NOT paid automatically. The Admin
+  /// decides explicitly; the decision is audited.
+  Future<void> _setPaid(int id, bool paid) async {
+    final reason = await _askText(
+      paid ? 'Mark as paid' : 'Mark as unpaid',
+      paid
+          ? 'This day will be paid in staff payroll. Your name, the time and the reason are recorded.'
+          : 'This day will not be paid in staff payroll.',
+      'Reason (required)',
+      minLen: 3,
+    );
+    if (reason == null) return;
+    try {
+      final r = await ApiConfig.dio.post('/staff-attendance/admin/$id/paid', data: {'is_paid': paid, 'reason': reason});
+      _showMessage((r.data is Map ? r.data['message'] : null)?.toString() ?? 'Saved', true);
+      await _fetchData();
+    } on DioException catch (e) {
+      _showMessage(_errorMessage(e, 'Failed to save the paid decision.'), false);
+    }
+  }
+
   Future<void> _reviewSelected(List<int> ids, String status, {String? note}) async {
     if (ids.isEmpty || _working) return;
+
+    String? ackNote;
+    if (status == 'Approved') {
+      final flagged = ids.map(_itemById).where(_hasOpenAnomaly).toList();
+      if (flagged.isNotEmpty) {
+        ackNote = await _askText(
+          'Records need review',
+          '${flagged.length} record(s) are flagged (${flagged.first?['anomaly_detail'] ?? 'long session'}). '
+              'Approve only after checking the times.',
+          'Review note (required)',
+        );
+        if (ackNote == null) return;
+      }
+    }
+
     setState(() => _working = true);
 
     final succeeded = <int>[];
     final failed = <int>[];
+    String? firstError;
     for (final id in ids) {
       try {
+        final flagged = _hasOpenAnomaly(_itemById(id));
         await ApiConfig.dio.post('/staff-attendance/review', data: {
           'staff_attendance_id': id,
           'status': status,
           'admin_note': note,
+          if (flagged && ackNote != null) 'acknowledge_anomaly': true,
+          if (flagged && ackNote != null) 'anomaly_note': ackNote,
         });
         succeeded.add(id);
+      } on DioException catch (e) {
+        failed.add(id);
+        firstError ??= _errorMessage(e, 'Request failed');
       } catch (_) {
         failed.add(id);
       }
@@ -102,7 +198,7 @@ class _StaffAttendanceReviewScreenState extends State<StaffAttendanceReviewScree
     if (failed.isEmpty) {
       _showMessage('${succeeded.length} record(s) processed successfully.', true);
     } else {
-      _showMessage('${succeeded.length} succeeded, ${failed.length} failed.', false);
+      _showMessage('${succeeded.length} succeeded, ${failed.length} failed.${firstError != null ? ' $firstError' : ''}', false);
     }
     await _fetchData();
   }
@@ -285,6 +381,55 @@ class _StaffAttendanceReviewScreenState extends State<StaffAttendanceReviewScree
                 ],
               ],
             ),
+            if (item['anomaly_code'] != null) ...[
+              const SizedBox(height: 8),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: item['anomaly_ack_at'] == null ? Colors.orange.shade50 : Colors.grey.shade100,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Row(children: [
+                  Icon(Icons.report_problem_rounded, size: 16, color: Colors.orange.shade800),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      item['anomaly_ack_at'] == null
+                          ? 'Needs review: ${item['anomaly_detail'] ?? item['anomaly_code']}'
+                          : 'Reviewed: ${item['anomaly_ack_note'] ?? ''}',
+                      style: TextStyle(fontSize: 12, color: Colors.orange.shade900),
+                    ),
+                  ),
+                  const HelpTip(title: 'Long session', message: HelpTexts.longShift, size: 16),
+                ]),
+              ),
+            ],
+            if (['Sick', 'Vacation', 'Holiday'].contains(attendanceStatus)) ...[
+              const SizedBox(height: 6),
+              Row(children: [
+                StatusPill(
+                  label: ('${item['is_paid']}' == '1' || item['is_paid'] == true) ? 'Paid' : 'Not paid',
+                  color: ('${item['is_paid']}' == '1' || item['is_paid'] == true) ? Colors.green.shade700 : Colors.grey.shade700,
+                  icon: Icons.payments_outlined,
+                ),
+                const SizedBox(width: 4),
+                const HelpTip(
+                  title: 'Paid leave decision',
+                  message: 'Sick, vacation and holiday days are not paid automatically. '
+                      'The Admin marks them as paid (or unpaid) explicitly; every decision is recorded.',
+                  size: 16,
+                ),
+                const Spacer(),
+                if (status == 'Submitted' || status == 'Approved')
+                  TextButton(
+                    onPressed: _working
+                        ? null
+                        : () => _setPaid(id, !('${item['is_paid']}' == '1' || item['is_paid'] == true)),
+                    child: Text(('${item['is_paid']}' == '1' || item['is_paid'] == true) ? 'Mark unpaid' : 'Mark as paid'),
+                  ),
+              ]),
+            ],
             if (rejected && item['admin_rejection_notes'] != null) ...[
               const SizedBox(height: 8),
               Container(

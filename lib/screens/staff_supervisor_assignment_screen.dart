@@ -8,6 +8,7 @@ import 'package:dio/dio.dart';
 import '../constants.dart';
 import '../widgets/custom_app_bar.dart';
 import '../widgets/app_data_table.dart';
+import '../widgets/help_tip.dart';
 
 class StaffSupervisorAssignmentScreen extends StatefulWidget {
   final Map<String, dynamic> staff;
@@ -152,25 +153,15 @@ class _StaffSupervisorAssignmentScreenState extends State<StaffSupervisorAssignm
   }
 
   Future<void> _unassignCurrent() async {
-    final confirm = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Unassign Staff Supervisor'),
-        content: const Text('This staff member will no longer have an assigned Staff Supervisor. Continue?'),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
-          FilledButton(
-            style: FilledButton.styleFrom(backgroundColor: Colors.orange.shade800),
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Unassign'),
-          ),
-        ],
-      ),
+    final lastDay = await pickLastAssignedDay(
+      context,
+      title: 'Unassign Staff Supervisor',
+      message: 'The Staff Supervisor stops supervising this staff member after the last day.',
     );
-    if (confirm != true) return;
+    if (lastDay == null) return;
 
     try {
-      await ApiConfig.dio.delete('/staff/$_staffId/supervisor-assignments/current');
+      await ApiConfig.dio.delete('/staff/$_staffId/supervisor-assignments/current', data: {'last_day': lastDay});
       if (!mounted) return;
       _showSnack('Staff Supervisor unassigned', Colors.blue);
       _loadAll();

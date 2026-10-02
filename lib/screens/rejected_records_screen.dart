@@ -99,12 +99,13 @@ class _RejectedRecordsScreenState extends State<RejectedRecordsScreen> {
     }
   }
 
-  Future<void> _resubmit(int id, String? newInIso, String? newOutIso, String remarks) async {
+  Future<void> _resubmit(int id, String? newInIso, String? newOutIso, String remarks, {String? attendanceStatus}) async {
     try {
       await ApiConfig.dio.patch('/attendance/$id/resubmit', data: {
-        'check_in_time': newInIso,
-        'check_out_time': newOutIso,
+        if (attendanceStatus == null || attendanceStatus == 'Present') 'check_in_time': newInIso,
+        if (attendanceStatus == null || attendanceStatus == 'Present') 'check_out_time': newOutIso,
         'remarks': remarks,
+        if (attendanceStatus != null) 'attendance_status': attendanceStatus,
       });
       _fetchRejected();
       if (mounted) {
@@ -129,6 +130,9 @@ class _RejectedRecordsScreenState extends State<RejectedRecordsScreen> {
     DateTime? checkIn = r['check_in_time'] != null ? DateTime.parse(r['check_in_time']).toLocal() : null;
     DateTime? checkOut = r['check_out_time'] != null ? DateTime.parse(r['check_out_time']).toLocal() : null;
     final remarksController = TextEditingController(text: r['remarks']?.toString() ?? '');
+    final recordDate = DateTime.tryParse((r['record_date'] ?? '').toString().split('T').first) ?? DateTime.now();
+    const statuses = ['Present', 'Absent', 'Sick', 'Vacation', 'Holiday'];
+    String attendanceStatus = statuses.contains(r['attendance_status']) ? r['attendance_status'] : 'Present';
 
     await showDialog(
       context: context,
@@ -143,10 +147,15 @@ class _RejectedRecordsScreenState extends State<RejectedRecordsScreen> {
               final picked = await showTimePicker(context: context, initialTime: initial);
 
               if (picked != null) {
-                final baseDate = checkIn ?? checkOut ?? DateTime.now();
-                final newDateTime = DateTime(
-                  baseDate.year, baseDate.month, baseDate.day, picked.hour, picked.minute,
+                // Check-in is always on the record date. Check-out is on the
+                // record date, or the next day for a night shift (when the
+                // picked time is not after check-in).
+                var newDateTime = DateTime(
+                  recordDate.year, recordDate.month, recordDate.day, picked.hour, picked.minute,
                 );
+                if (!isCheckIn && checkIn != null && !newDateTime.isAfter(checkIn!)) {
+                  newDateTime = newDateTime.add(const Duration(days: 1));
+                }
                 setDialogState(() {
                   if (isCheckIn) {
                     checkIn = newDateTime;
@@ -198,9 +207,27 @@ class _RejectedRecordsScreenState extends State<RejectedRecordsScreen> {
                       ),
                     const Divider(),
                     const SizedBox(height: 8),
-                    _timeRow('Check-in Time', checkIn, () => pickTime(true)),
+                    DropdownButtonFormField<String>(
+                      value: attendanceStatus,
+                      decoration: InputDecoration(
+                        labelText: 'Attendance status',
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+                      ),
+                      items: statuses.map((s) => DropdownMenuItem(value: s, child: Text(s))).toList(),
+                      onChanged: (v) => setDialogState(() => attendanceStatus = v ?? attendanceStatus),
+                    ),
                     const SizedBox(height: 12),
-                    _timeRow('Check-out Time', checkOut, () => pickTime(false)),
+                    if (attendanceStatus == 'Present') ...[
+                      _timeRow('Check-in Time', checkIn, () => pickTime(true)),
+                      const SizedBox(height: 12),
+                      _timeRow('Check-out Time', checkOut, () => pickTime(false)),
+                      if (checkIn != null && checkOut != null && checkOut!.day != checkIn!.day)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 6),
+                          child: Text('Check-out is on the next day (night shift).',
+                              style: TextStyle(fontSize: 12, color: Colors.indigo.shade400)),
+                        ),
+                    ],
                     const SizedBox(height: 16),
                     TextField(
                       controller: remarksController,
@@ -223,6 +250,7 @@ class _RejectedRecordsScreenState extends State<RejectedRecordsScreen> {
                       checkIn == null ? null : DateFormat('yyyy-MM-dd HH:mm:ss').format(checkIn!),
                       checkOut == null ? null : DateFormat('yyyy-MM-dd HH:mm:ss').format(checkOut!),
                       remarksController.text,
+                      attendanceStatus: attendanceStatus,
                     );
                   },
                   icon: const Icon(Icons.send, size: 18),

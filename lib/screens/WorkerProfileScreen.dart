@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
-import 'package:url_launcher/url_launcher.dart'; // نحتاج هذه الحزمة لفتح الرابط وتنزيله
 import '../constants.dart';
 import '../widgets/custom_app_bar.dart';
+import '../widgets/protected_image.dart';
 
 class WorkerProfileScreen extends StatelessWidget {
   final Map<String, dynamic> worker;
@@ -9,24 +9,6 @@ class WorkerProfileScreen extends StatelessWidget {
   const WorkerProfileScreen({Key? key, required this.worker}) : super(key: key);
 
   final Color primaryColor = const Color(0xFF2563EB);
-
-  // دالة لفتح رابط الهوية لتنزيلها
-  Future<void> _downloadIdImage(BuildContext context, String imageUrl) async {
-    final Uri uri = Uri.parse(imageUrl);
-    try {
-      if (await canLaunchUrl(uri)) {
-        await launchUrl(uri, mode: LaunchMode.externalApplication);
-      } else {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Could not launch the ID link')),
-        );
-      }
-    } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error: $e')),
-      );
-    }
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -57,19 +39,11 @@ class WorkerProfileScreen extends StatelessWidget {
               ),
               child: Row(
                 children: [
-                  CircleAvatar(
+                  ProtectedAvatar(
+                    url: worker['personal_photo']?.toString(),
                     radius: 35,
                     backgroundColor: primaryColor.withOpacity(0.1),
-                    backgroundImage: (worker['personal_photo'] != null && 
-                                      worker['personal_photo'].toString().trim().isNotEmpty &&
-                                      worker['personal_photo'].toString().startsWith('http'))
-                        ? NetworkImage(worker['personal_photo'].toString())
-                        : null,
-                    child: (worker['personal_photo'] == null || 
-                            worker['personal_photo'].toString().trim().isEmpty || 
-                            !worker['personal_photo'].toString().startsWith('http'))
-                        ? Icon(Icons.person, size: 40, color: primaryColor)
-                        : null,
+                    iconColor: primaryColor,
                   ),
                   const SizedBox(width: 16),
                   Expanded(
@@ -232,7 +206,7 @@ FutureBuilder(
                         const SizedBox(height: 4),
                         Text(
                           (idPhotoUrl != null && idPhotoUrl.toString().trim().isNotEmpty)
-                              ? 'Click to download/view ID'
+                              ? 'Click to view ID'
                               : 'No ID provided',
                           style: TextStyle(color: Colors.grey.shade600, fontSize: 13),
                         ),
@@ -241,7 +215,7 @@ FutureBuilder(
                   ),
                   ElevatedButton.icon(
                     onPressed: (idPhotoUrl != null && idPhotoUrl.toString().trim().isNotEmpty && idPhotoUrl.toString().startsWith('http'))
-                        ? () => _downloadIdImage(context, idPhotoUrl)
+                        ? () => showProtectedImageDialog(context, idPhotoUrl, title: 'ID document')
                         : null,
                     style: ElevatedButton.styleFrom(
                       backgroundColor: primaryColor,

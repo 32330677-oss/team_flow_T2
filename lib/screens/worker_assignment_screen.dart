@@ -4,6 +4,7 @@ import '../constants.dart';
 import '../widgets/searchable_picker_sheet.dart';
 import '../widgets/custom_app_bar.dart';
 import '../widgets/app_data_table.dart';
+import '../widgets/help_tip.dart';
 
 class WorkerAssignmentScreen extends StatefulWidget {
   const WorkerAssignmentScreen({Key? key}) : super(key: key);
@@ -43,171 +44,253 @@ class _WorkerAssignmentScreenState extends State<WorkerAssignmentScreen> {
     setState(() => _isLoading = false);
   }
 
-  Future<void> _deleteAssignment(int assignmentId) async {
-    bool? confirm = await showDialog(
+  String _fmtDate(DateTime d) =>
+      '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+
+  String _apiError(Object e, String fallback) {
+    if (e is DioException && e.response?.data is Map) {
+      return (e.response?.data['message'] ?? fallback).toString();
+    }
+    return fallback;
+  }
+
+  /// Shared dialog: date (with rule text) + mandatory reason.
+  Future<Map<String, String>?> _dateReasonDialog({
+    required String title,
+    required String dateLabel,
+    required String dateHelp,
+    required DateTime initialDate,
+    required DateTime firstDate,
+    String confirmLabel = 'Confirm',
+    Color? confirmColor,
+    Widget? extra,
+  }) async {
+    DateTime picked = initialDate;
+    final reasonCtrl = TextEditingController();
+    String? error;
+    final result = await showDialog<Map<String, String>>(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Confirm', style: TextStyle(fontWeight: FontWeight.bold)),
-        content: const Text('Are you sure you want to end this worker assignment?'),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: AppColors.danger),
-            onPressed: () => Navigator.pop(ctx, true), 
-            child: const Text('Confirm', style: TextStyle(color: Colors.white)),
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setD) => AlertDialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          title: Row(children: [
+            Expanded(child: Text(title, style: const TextStyle(fontWeight: FontWeight.bold))),
+            const HelpTip(title: 'Assignment dates', message: HelpTexts.assignmentDates),
+          ]),
+          content: SizedBox(
+            width: 420,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (extra != null) ...[extra, const SizedBox(height: 12)],
+                Text(dateLabel, style: const TextStyle(fontWeight: FontWeight.w600)),
+                const SizedBox(height: 6),
+                OutlinedButton.icon(
+                  icon: const Icon(Icons.calendar_today_rounded, size: 18),
+                  label: Text(_fmtDate(picked)),
+                  onPressed: () async {
+                    final d = await showDatePicker(
+                      context: ctx,
+                      initialDate: picked,
+                      firstDate: firstDate,
+                      lastDate: DateTime.now().add(const Duration(days: 365)),
+                    );
+                    if (d != null) setD(() => picked = d);
+                  },
+                ),
+                const SizedBox(height: 4),
+                Text(dateHelp, style: TextStyle(fontSize: 12, color: Colors.grey.shade700)),
+                const SizedBox(height: 14),
+                TextField(
+                  controller: reasonCtrl,
+                  maxLines: 2,
+                  decoration: InputDecoration(
+                    labelText: 'Reason (required)',
+                    errorText: error,
+                    border: const OutlineInputBorder(),
+                  ),
+                ),
+              ],
+            ),
           ),
-        ],
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(backgroundColor: confirmColor ?? AppColors.primary),
+              onPressed: () {
+                if (reasonCtrl.text.trim().length < 3) {
+                  setD(() => error = 'Please enter a reason');
+                  return;
+                }
+                Navigator.pop(ctx, {'date': _fmtDate(picked), 'reason': reasonCtrl.text.trim()});
+              },
+              child: Text(confirmLabel, style: const TextStyle(color: Colors.white)),
+            ),
+          ],
+        ),
       ),
     );
+    reasonCtrl.dispose();
+    return result;
+  }
 
-    if (confirm != true) return;
-
+  /// End Assignment: the chosen date is the LAST assigned day (inclusive).
+  Future<void> _deleteAssignment(int assignmentId) async {
+    final a = _assignments.firstWhere(
+      (x) => x['assignment_id'].toString() == assignmentId.toString(),
+      orElse: () => <String, dynamic>{},
+    );
+    final start = DateTime.tryParse(a['assigned_date']?.toString() ?? '') ?? DateTime(2020);
+    final today = DateTime.now();
+    final res = await _dateReasonDialog(
+      title: 'End assignment — ${a['worker_name'] ?? 'Worker'}',
+      dateLabel: 'Last day assigned',
+      dateHelp: 'The worker is still assigned on this day. The next day is the first day outside the assignment.',
+      initialDate: DateTime(today.year, today.month, today.day),
+      firstDate: start.subtract(const Duration(days: 1)),
+      confirmLabel: 'End assignment',
+      confirmColor: AppColors.danger,
+    );
+    if (res == null) return;
     try {
-      await ApiConfig.dio.delete('/assignments/$assignmentId');
-      _loadData(); 
-      _showSnackBar('Assignment ended successfully', Colors.blue);
+      await ApiConfig.dio.post('/assignments/$assignmentId/end',
+          data: {'last_day': res['date'], 'reason': res['reason']});
+      await _loadData();
+      _showSnackBar('Assignment ended. Last assigned day: ${res['date']}', Colors.blue);
     } catch (e) {
-      _showSnackBar('Failed to end assignment', AppColors.danger);
+      _showSnackBar(_apiError(e, 'Failed to end assignment'), AppColors.danger);
     }
   }
 
-Future<void> _transferWorker(Map<String, dynamic> assignment) async {
-  final currentSiteId =
-      int.tryParse(assignment['site_id']?.toString() ?? '0') ?? 0;
+  /// Direct transfer (no approval workflow, fully audited by the backend):
+  /// transfer date = FIRST day at the new site; old assignment ends the day before.
+  Future<void> _transferWorker(Map<String, dynamic> assignment) async {
+    final currentSiteId = int.tryParse(assignment['site_id']?.toString() ?? '0') ?? 0;
+    final workerName = assignment['worker_name'] ?? 'Worker';
+    final currentShiftType = assignment['shift_type']?.toString() == 'Night' ? 'Night' : 'Day';
+    final assignmentId = int.tryParse(assignment['assignment_id']?.toString() ?? '');
 
-  final workerId =
-      int.tryParse(assignment['worker_id']?.toString() ?? '0') ?? 0;
-
-  final workerName = assignment['worker_name'] ?? 'Worker';
-
-  final currentShiftType =
-      assignment['shift_type']?.toString() == 'Night' ? 'Night' : 'Day';
-
-  // Build Site + Shift target options.
-  final availableTargets = <Map<String, dynamic>>[];
-
-  for (final site in _sites) {
-    final siteId =
-        int.tryParse(site['site_id']?.toString() ?? '0') ?? 0;
-
-    if (siteId == 0) continue;
-
-    final supportsShifts =
-        site['supports_shifts'] == 1 ||
-        site['supports_shifts'] == true;
-
-    if (supportsShifts) {
-      // Shift-based site: offer both Day and Night.
-      for (final shift in ['Day', 'Night']) {
-        // Do not offer the exact current site + current shift.
-        if (siteId == currentSiteId &&
-            shift == currentShiftType) {
-          continue;
+    final availableTargets = <Map<String, dynamic>>[];
+    for (final site in _sites) {
+      final siteId = int.tryParse(site['site_id']?.toString() ?? '0') ?? 0;
+      if (siteId == 0) continue;
+      final status = (site['site_status'] ?? site['status'])?.toString();
+      if (status != null && status != 'Active') continue;
+      final supportsShifts = site['supports_shifts'] == 1 || site['supports_shifts'] == true;
+      if (supportsShifts) {
+        for (final shift in ['Day', 'Night']) {
+          if (siteId == currentSiteId && shift == currentShiftType) continue;
+          availableTargets.add({
+            'site_id': siteId,
+            'shift_type': shift,
+            'display_label': '${site['site_name'] ?? ''} — $shift',
+          });
         }
-
+      } else {
+        if (siteId == currentSiteId) continue;
         availableTargets.add({
           'site_id': siteId,
-          'site_name': site['site_name'] ?? '',
-          'shift_type': shift,
-          'display_label':
-              '${site['site_name'] ?? ''} — $shift',
+          'shift_type': 'Day',
+          'display_label': site['site_name']?.toString() ?? '',
         });
       }
-    } else {
-      // Normal site: one target only.
-      if (siteId == currentSiteId) {
-        continue;
-      }
+    }
+    if (availableTargets.isEmpty || assignmentId == null) {
+      _showSnackBar('No other active sites or shifts to transfer to', Colors.orange);
+      return;
+    }
 
-      availableTargets.add({
-        'site_id': siteId,
-        'site_name': site['site_name'] ?? '',
-        'shift_type': 'Day',
-        'display_label': site['site_name'] ?? '',
+    final pickedTarget = await SearchablePickerSheet.show<dynamic>(
+      context,
+      title: 'Transfer $workerName to',
+      items: availableTargets,
+      labelBuilder: (t) => t['display_label']?.toString() ?? '',
+    );
+    if (pickedTarget == null) return;
+
+    final start = DateTime.tryParse(assignment['assigned_date']?.toString() ?? '') ?? DateTime(2020);
+    final today = DateTime.now();
+    final res = await _dateReasonDialog(
+      title: 'Direct transfer — $workerName',
+      dateLabel: 'Transfer date (first day at the new site)',
+      dateHelp: 'The current assignment ends automatically on the previous day. '
+          'Recorded with your name, date and reason in the audit trail.',
+      initialDate: DateTime(today.year, today.month, today.day),
+      firstDate: start.add(const Duration(days: 1)),
+      confirmLabel: 'Transfer',
+      extra: Container(
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          color: Colors.blue.shade50,
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: Text(
+          'From: ${assignment['site_name'] ?? ''} ($currentShiftType)\nTo: ${pickedTarget['display_label']}',
+          style: const TextStyle(fontWeight: FontWeight.w600),
+        ),
+      ),
+    );
+    if (res == null) return;
+
+    try {
+      final response = await ApiConfig.dio.post('/assignments/$assignmentId/transfer', data: {
+        'transfer_date': res['date'],
+        'target_site_id': pickedTarget['site_id'],
+        'target_shift_type': pickedTarget['shift_type'],
+        'reason': res['reason'],
       });
+      if (response.statusCode == 201 || response.statusCode == 200) {
+        await _loadData();
+        _showSnackBar('Worker transferred. First day at new site: ${res['date']}', Colors.green.shade700);
+      }
+    } catch (e) {
+      _showSnackBar(_apiError(e, 'Failed to transfer worker'), AppColors.danger);
     }
   }
 
-  if (availableTargets.isEmpty) {
-    _showSnackBar(
-      'No other available sites or shifts to transfer to',
-      Colors.orange,
-    );
-    return;
-  }
-
-  final pickedTarget =
-      await SearchablePickerSheet.show<dynamic>(
-    context,
-    title: 'Transfer $workerName to',
-    items: availableTargets,
-    labelBuilder: (target) =>
-        target['display_label']?.toString() ?? '',
-  );
-
-  if (pickedTarget == null) return;
-
-  final newSiteId =
-      int.tryParse(pickedTarget['site_id']?.toString() ?? '');
-
-  final newShiftType =
-      pickedTarget['shift_type']?.toString() == 'Night'
-          ? 'Night'
-          : 'Day';
-
-  final assignmentId =
-      int.tryParse(assignment['assignment_id']?.toString() ?? '');
-
-  if (newSiteId == null || assignmentId == null) {
-    _showSnackBar(
-      'Invalid transfer data',
-      AppColors.danger,
-    );
-    return;
-  }
-
-  try {
-    // End current assignment.
-    await ApiConfig.dio.delete(
-      '/assignments/$assignmentId',
-    );
-
-    // Create the new assignment.
-    final response = await ApiConfig.dio.post(
-      '/assignments',
-      data: {
-        'worker_id': workerId,
-        'site_id': newSiteId,
-        'shift_type': newShiftType,
-      },
-    );
-
-    if (response.statusCode == 201 ||
-        response.statusCode == 200) {
-      await _loadData();
-
-      _showSnackBar(
-        'Worker transferred successfully!',
-        Colors.green.shade700,
+  /// Read-only assignment history for one worker (closed + current periods).
+  Future<void> _showHistory(Map<String, dynamic> assignment) async {
+    final workerId = assignment['worker_id'];
+    try {
+      final r = await ApiConfig.dio.get('/assignments/worker/$workerId');
+      final rows = (r.data['data'] as List?) ?? [];
+      if (!mounted) return;
+      await showDialog(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: Text('Assignment history — ${assignment['worker_name'] ?? ''}'),
+          content: SizedBox(
+            width: 520,
+            child: rows.isEmpty
+                ? const Text('No history found.')
+                : ListView.separated(
+                    shrinkWrap: true,
+                    itemCount: rows.length,
+                    separatorBuilder: (_, __) => const Divider(height: 1),
+                    itemBuilder: (_, i) {
+                      final h = rows[i];
+                      final end = (h['last_day'] ?? h['unassigned_date'])?.toString();
+                      return ListTile(
+                        dense: true,
+                        leading: Icon(end == null ? Icons.play_circle : Icons.history,
+                            color: end == null ? Colors.green : Colors.grey),
+                        title: Text('${h['site_name'] ?? 'Site ${h['site_id']}'} · ${h['shift_type'] ?? 'Day'}'),
+                        subtitle: Text(
+                          '${h['assigned_date']} → ${end ?? 'open'}'
+                          '${h['end_reason'] != null ? '\nReason: ${h['end_reason']}' : ''}',
+                        ),
+                      );
+                    },
+                  ),
+          ),
+          actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Close'))],
+        ),
       );
+    } catch (e) {
+      _showSnackBar(_apiError(e, 'Failed to load history'), AppColors.danger);
     }
-  } on DioException catch (e) {
-    final errorMessage = e.response?.data is Map
-        ? (e.response?.data['message'] ??
-            'Failed to transfer worker')
-        : 'Failed to transfer worker';
-
-    _showSnackBar(
-      errorMessage.toString(),
-      AppColors.danger,
-    );
-  } catch (e) {
-    _showSnackBar(
-      'Connection error during transfer',
-      AppColors.danger,
-    );
   }
-}
 
   void _showSnackBar(String message, Color color, {Duration? duration}) {
     ScaffoldMessenger.of(context).hideCurrentSnackBar();
@@ -388,6 +471,11 @@ Widget build(BuildContext context) {
                                       mainAxisSize: MainAxisSize.min,
                                       children: [
                                         IconButton(
+                                          icon: const Icon(Icons.history_rounded, color: Colors.blueGrey, size: 20),
+                                          tooltip: 'Assignment history',
+                                          onPressed: () => _showHistory(assignment),
+                                        ),
+                                        IconButton(
                                           icon: const Icon(
                                             Icons.swap_horiz,
                                             color: Colors.blue,
@@ -401,7 +489,7 @@ Widget build(BuildContext context) {
                                         ),
                                         IconButton(
                                           icon: const Icon(
-                                            Icons.delete_forever,
+                                            Icons.event_busy_rounded,
                                             color: AppColors.danger,
                                             size: 20,
                                           ),
@@ -604,6 +692,11 @@ Widget build(BuildContext context) {
                                     mainAxisSize: MainAxisSize.min,
                                     children: [
                                       IconButton(
+                                        icon: const Icon(Icons.history_rounded, color: Colors.blueGrey, size: 20),
+                                        tooltip: 'Assignment history',
+                                        onPressed: () => _showHistory(assignment),
+                                      ),
+                                      IconButton(
                                         icon: const Icon(
                                           Icons.swap_horiz,
                                           color: Colors.blue,
@@ -617,7 +710,7 @@ Widget build(BuildContext context) {
                                       ),
                                       IconButton(
                                         icon: const Icon(
-                                          Icons.delete_forever,
+                                          Icons.event_busy_rounded,
                                           color: AppColors.danger,
                                           size: 20,
                                         ),

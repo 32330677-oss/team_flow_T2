@@ -12,6 +12,7 @@ import '../screens/staff_attendance_payroll_hub.dart';
 import '../screens/supervisor_management_screen.dart';
 import '../screens/biometric_processing_screen.dart';
 import '../screens/biometric_import_screen.dart';
+import '../screens/change_password_screen.dart';
 class AppDrawer extends StatelessWidget {
   const AppDrawer({super.key});
 
@@ -187,6 +188,17 @@ void _confirmLogout() {
                         );
                       }).toList(),
                     ),
+                  ),
+                  // C-19: password change reachable from every role's menu.
+                  ListTile(
+                    leading: const Icon(Icons.lock_reset_rounded, color: Colors.white70),
+                    title: const Text('Change Password',
+                        style: TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
+                    onTap: () {
+                      Navigator.pop(context);
+                      Navigator.push(context,
+                          MaterialPageRoute(builder: (_) => const ChangePasswordScreen()));
+                    },
                   ),
                   Padding(
                     padding: const EdgeInsets.symmetric(

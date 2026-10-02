@@ -211,7 +211,11 @@ class _PendingTransfersScreenState extends State<PendingTransfersScreen> {
           ),
           ElevatedButton(
             style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-            onPressed: () => Navigator.pop(ctx, controller.text),
+            onPressed: () {
+              // Rejection reason is mandatory (stored and audited).
+              if (controller.text.trim().length < 3) return;
+              Navigator.pop(ctx, controller.text.trim());
+            },
             child: const Text(
               'Confirm Rejection',
               style: TextStyle(color: Colors.white),
@@ -333,6 +337,21 @@ class _PendingTransfersScreenState extends State<PendingTransfersScreen> {
                                   ),
                                 ],
                               ),
+                              if ((req['request_reason'] ?? '').toString().isNotEmpty) ...[
+                                const SizedBox(height: 8),
+                                Container(
+                                  width: double.infinity,
+                                  padding: const EdgeInsets.all(8),
+                                  decoration: BoxDecoration(
+                                    color: Colors.blueGrey.shade50,
+                                    borderRadius: BorderRadius.circular(8),
+                                  ),
+                                  child: Text(
+                                    'Reason: ${req['request_reason']}',
+                                    style: const TextStyle(fontSize: 12.5),
+                                  ),
+                                ),
+                              ],
                               const SizedBox(height: 8),
                               Text(
                                 'Effective date: ${req['effective_date'] ?? 'not set (choose when approving)'}',

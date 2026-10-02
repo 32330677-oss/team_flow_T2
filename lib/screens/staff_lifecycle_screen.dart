@@ -13,6 +13,7 @@ import 'package:dio/dio.dart';
 import '../constants.dart';
 import '../widgets/custom_app_bar.dart';
 import '../widgets/app_data_table.dart';
+import '../widgets/help_tip.dart';
 
 class StaffLifecycleScreen extends StatefulWidget {
   final Map<String, dynamic> staff;
@@ -270,25 +271,15 @@ String selectedStatus = _currentStatus == 'Terminated'
   }
 
   Future<void> _unassignCurrentSite() async {
-    final confirm = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Unassign from Site'),
-        content: const Text('This staff member will no longer be tied to a fixed site. Continue?'),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
-          FilledButton(
-            style: FilledButton.styleFrom(backgroundColor: Colors.orange.shade800),
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Unassign'),
-          ),
-        ],
-      ),
+    final lastDay = await pickLastAssignedDay(
+      context,
+      title: 'Unassign from Site',
+      message: 'This staff member will no longer be tied to a fixed site after the last day.',
     );
-    if (confirm != true) return;
+    if (lastDay == null) return;
 
     try {
-      await ApiConfig.dio.delete('/staff/$_staffId/assignments/current');
+      await ApiConfig.dio.delete('/staff/$_staffId/assignments/current', data: {'last_day': lastDay});
       if (!mounted) return;
       _showSnack('Staff member unassigned from site', Colors.blue);
       _loadAll();

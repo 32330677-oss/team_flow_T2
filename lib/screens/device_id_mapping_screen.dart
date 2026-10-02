@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../services/biometric_device_mapping_service.dart';
+import 'device_mappings_manage_screen.dart';
 import '../services/biometric_processing_service.dart'
     show BiometricApiException;
 import '../widgets/app_data_table.dart';
@@ -259,6 +260,14 @@ class _DeviceIdMappingScreenState
       appBar: CustomAppBar(
         title: 'Device ID Mapping',
         actions: [
+          IconButton(
+            tooltip: 'Existing mappings (End / Void / Impact)',
+            icon: const Icon(Icons.manage_search_rounded),
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const DeviceMappingsManageScreen()),
+            ),
+          ),
           IconButton(
             tooltip: 'Refresh',
             icon: const Icon(Icons.refresh),

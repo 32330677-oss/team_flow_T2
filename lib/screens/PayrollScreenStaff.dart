@@ -192,32 +192,104 @@ class _StaffPayrollScreenState extends State<StaffPayrollScreen> {
     }
   }
 
-  Future<void> _supersede(int batchId) async {
+  Future<String?> _askReason(String title, String message, String confirm) async {
     final controller = TextEditingController();
+    String? err;
     final reason = await showDialog<String>(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Supersede & Correct'),
-        content: TextField(controller: controller, maxLines: 3, decoration: const InputDecoration(hintText: 'Reason for correction...', border: OutlineInputBorder())),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
-          ElevatedButton(onPressed: () => Navigator.pop(ctx, controller.text), child: const Text('Proceed')),
-        ],
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setD) => AlertDialog(
+          title: Text(title),
+          content: SizedBox(
+            width: 460,
+            child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(message),
+              const SizedBox(height: 12),
+              TextField(
+                controller: controller,
+                maxLines: 3,
+                decoration: InputDecoration(labelText: 'Reason (required, min. 5 characters)', errorText: err, border: const OutlineInputBorder()),
+              ),
+            ]),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+            ElevatedButton(
+              onPressed: () {
+                if (controller.text.trim().length < 5) {
+                  setD(() => err = 'Please enter a clear reason');
+                  return;
+                }
+                Navigator.pop(ctx, controller.text.trim());
+              },
+              child: Text(confirm),
+            ),
+          ],
+        ),
       ),
     );
-    if (reason == null || reason.trim().isEmpty) return;
+    controller.dispose();
+    return reason;
+  }
+
+  /// D-03: atomic correction. The server validates, generates the new version,
+  /// verifies it and only then marks this batch Superseded (one transaction).
+  Future<void> _supersede(int batchId, {String? reason, bool acknowledgePending = false}) async {
+    reason ??= await _askReason(
+      'Correct (supersede) batch #$batchId',
+      'A new version is generated for the same period from the current approved attendance. '
+          'This batch is kept as "Superseded" for audit. Paid batches can never be superseded.',
+      'Generate new version',
+    );
+    if (reason == null) return;
     try {
-      final res = await ApiConfig.dio.post('/staff-payroll/batch/$batchId/new-version', data: {'reason': reason});
-      final params = res.data['next_version_params'];
-      if (params != null) {
-        _startDateController.text = params['start_date'] ?? '';
-        _endDateController.text = params['end_date'] ?? '';
-      }
-      _showSnack('Batch superseded. Generate the new version now.', Colors.deepOrange);
+      final res = await ApiConfig.dio.post('/staff-payroll/batch/$batchId/new-version', data: {
+        'reason': reason,
+        if (acknowledgePending) 'acknowledge_pending': true,
+      });
+      _showSnack((res.data['message'] ?? 'New version generated').toString(), Colors.green.shade700);
       _loadBatches();
     } on DioException catch (e) {
-      final msg = e.response?.data is Map ? (e.response?.data['message'] ?? 'Failed to supersede') : 'Failed to supersede';
-      _showSnack(msg, AppColors.danger);
+      final data = e.response?.data;
+      if (data is Map && data['code'] == 'PENDING_ATTENDANCE' && !acknowledgePending) {
+        final pending = (data['pending_attendance'] as List? ?? [])
+            .map((item) => '${item['full_name'] ?? 'Staff'} — ${item['record_date'] ?? ''} (${item['status'] ?? ''})')
+            .join('\n');
+        if (!mounted) return;
+        final ok = await showDialog<bool>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('Unresolved attendance found'),
+            content: SingleChildScrollView(child: Text('$pending\n\nThese records will NOT be paid in the new version. Continue?')),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+              ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Acknowledge & continue')),
+            ],
+          ),
+        );
+        if (ok == true) await _supersede(batchId, reason: reason, acknowledgePending: true);
+        return;
+      }
+      final msg = data is Map ? (data['message'] ?? 'Failed to supersede') : 'Failed to supersede';
+      _showSnack(msg.toString(), AppColors.danger);
+    }
+  }
+
+  /// D-03: void a Generated, not finalized batch (kept for audit, nothing deleted).
+  Future<void> _voidBatch(int batchId) async {
+    final reason = await _askReason(
+      'Void batch #$batchId',
+      'Use only for a batch generated by mistake. It stays in the history as "Voided" and the period can be generated again.',
+      'Void batch',
+    );
+    if (reason == null) return;
+    try {
+      final res = await ApiConfig.dio.patch('/staff-payroll/batch/$batchId/void', data: {'reason': reason});
+      _showSnack((res.data['message'] ?? 'Batch voided').toString(), Colors.blueGrey);
+      _loadBatches();
+    } on DioException catch (e) {
+      final msg = e.response?.data is Map ? (e.response?.data['message'] ?? 'Failed to void') : 'Failed to void';
+      _showSnack(msg.toString(), AppColors.danger);
     }
   }
 
@@ -399,35 +471,43 @@ void _showBatchDetailsSheet(Map batch, List staff) {
                 decoration: BoxDecoration(color: Colors.grey.shade50, border: Border(top: BorderSide(color: Colors.grey.shade200))),
                 child: Row(
                   children: [
-                    Expanded(child: Text('Total: ${batch['total_amount']} USD (${batch['total_staff']} staff)', style: const TextStyle(fontWeight: FontWeight.bold))),
-                    if (status != 'Paid' && status != 'Superseded') ...[
-                      if (!isFinalized)
-                        ElevatedButton.icon(
-                          onPressed: () {
-                            Navigator.pop(context);
-                            _finalizeBatch(batch['staff_payroll_batch_id']);
-                          },
-                          icon: const Icon(Icons.lock_outline, size: 16, color: Colors.white),
-                          label: const Text('Finalize', style: TextStyle(color: Colors.white)),
-                          style: ElevatedButton.styleFrom(backgroundColor: Colors.indigo),
-                        )
-                      else
-                        ElevatedButton.icon(
-                          onPressed: () {
-                            Navigator.pop(context);
-                            _markPaid(batch['staff_payroll_batch_id']);
-                          },
-                          icon: const Icon(Icons.check_circle, size: 16, color: Colors.white),
-                          label: const Text('Mark Paid', style: TextStyle(color: Colors.white)),
-                          style: ElevatedButton.styleFrom(backgroundColor: Colors.green.shade700),
-                        ),
-                      const SizedBox(width: 8),
+                    Expanded(child: Text('Total: ${batch['total_amount']} ${batch['currency'] ?? 'USD'} (${batch['total_staff']} staff)', style: const TextStyle(fontWeight: FontWeight.bold))),
+                    if (status == 'Generated' && !isFinalized) ...[
+                      TextButton(
+                        onPressed: () {
+                          Navigator.pop(context);
+                          _voidBatch(batch['staff_payroll_batch_id']);
+                        },
+                        child: const Text('Void', style: TextStyle(color: AppColors.danger)),
+                      ),
+                      const SizedBox(width: 4),
+                      ElevatedButton.icon(
+                        onPressed: () {
+                          Navigator.pop(context);
+                          _finalizeBatch(batch['staff_payroll_batch_id']);
+                        },
+                        icon: const Icon(Icons.lock_outline, size: 16, color: Colors.white),
+                        label: const Text('Finalize', style: TextStyle(color: Colors.white)),
+                        style: ElevatedButton.styleFrom(backgroundColor: Colors.indigo),
+                      ),
+                    ],
+                    if (status == 'Generated' && isFinalized) ...[
                       OutlinedButton(
                         onPressed: () {
                           Navigator.pop(context);
                           _supersede(batch['staff_payroll_batch_id']);
                         },
-                        child: const Text('Supersede'),
+                        child: const Text('Correct (supersede)'),
+                      ),
+                      const SizedBox(width: 8),
+                      ElevatedButton.icon(
+                        onPressed: () {
+                          Navigator.pop(context);
+                          _markPaid(batch['staff_payroll_batch_id']);
+                        },
+                        icon: const Icon(Icons.check_circle, size: 16, color: Colors.white),
+                        label: const Text('Mark Paid', style: TextStyle(color: Colors.white)),
+                        style: ElevatedButton.styleFrom(backgroundColor: Colors.green.shade700),
                       ),
                     ],
                   ],

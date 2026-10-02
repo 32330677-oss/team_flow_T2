@@ -4,6 +4,7 @@ import 'package:image_picker/image_picker.dart';
 import 'dart:io';
 import '../constants.dart';
 import '../widgets/custom_app_bar.dart';
+import '../widgets/protected_image.dart';
 import 'WorkerProfileScreen.dart';
 import '../widgets/app_drawer.dart';
 class WorkersScreen extends StatefulWidget {
@@ -581,6 +582,10 @@ Future<void> _submitBulkCompensation(void Function(void Function()) setModalStat
     final newStatus = currentStatus == 'Active' ? 'Inactive' : 'Active';
     DateTime effective = DateTime.now();
     final reasonCtl = TextEditingController();
+    // §27 / R-14: becoming Inactive does not end assignments by itself. The
+    // Admin may explicitly end them; the last assigned day is the day before
+    // the Inactive date (inclusive semantics).
+    bool endAssignments = false;
     String fmt(DateTime d) =>
         '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
     final confirmed = await showDialog<bool>(
@@ -607,6 +612,19 @@ Future<void> _submitBulkCompensation(void Function(void Function()) setModalStat
                   if (picked != null) setD(() => effective = picked);
                 },
               ),
+              const SizedBox(height: 4),
+              Text('First day the new status applies. Past attendance keeps the status of its own date.',
+                  style: TextStyle(fontSize: 12, color: Colors.grey.shade700)),
+              if (newStatus == 'Inactive') ...[
+                const SizedBox(height: 6),
+                CheckboxListTile(
+                  contentPadding: EdgeInsets.zero,
+                  value: endAssignments,
+                  onChanged: (v) => setD(() => endAssignments = v == true),
+                  title: const Text('Also end site assignments'),
+                  subtitle: Text('Last assigned day: ${fmt(effective.subtract(const Duration(days: 1)))}'),
+                ),
+              ],
               const SizedBox(height: 10),
               TextField(
                 controller: reasonCtl,
@@ -629,6 +647,8 @@ Future<void> _submitBulkCompensation(void Function(void Function()) setModalStat
         'status': newStatus,
         'status_effective_date': fmt(effective),
         if (reason.isNotEmpty) 'status_reason': reason,
+        if (newStatus == 'Inactive' && endAssignments)
+          'end_assignments_last_day': fmt(effective.subtract(const Duration(days: 1))),
       });
       if (response.statusCode == 200) {
         _fetchWorkers();
@@ -1111,23 +1131,11 @@ const SizedBox(height: 20),
                                   );
                                 },
                                 contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                                leading: CircleAvatar(
-  backgroundColor: isActive ? primaryColor.withOpacity(0.1) : Colors.grey.shade200,
-  
-  // 1. هنا نضع شرطاً صارماً: هل الحقل موجود؟ وهل هو نص؟ وهل يبدأ بـ http؟
-  backgroundImage: (worker['personal_photo'] != null && 
-                    worker['personal_photo'].toString().trim().isNotEmpty &&
-                    worker['personal_photo'].toString().startsWith('http'))
-      ? NetworkImage(worker['personal_photo'].toString())
-      : null,
-      
-  // 2. إذا لم يتحقق الشرط، نعرض أيقونة شخص افتراضية بكل بساطة
-  child: (worker['personal_photo'] == null || 
-          worker['personal_photo'].toString().trim().isEmpty || 
-          !worker['personal_photo'].toString().startsWith('http'))
-      ? Icon(Icons.person, color: isActive ? primaryColor : Colors.grey)
-      : null,
-),
+                                leading: ProtectedAvatar(
+                                  url: worker['personal_photo']?.toString(),
+                                  backgroundColor: isActive ? primaryColor.withOpacity(0.1) : Colors.grey.shade200,
+                                  iconColor: isActive ? primaryColor : Colors.grey,
+                                ),
                                 title: Text(
                                   worker['full_name'] ?? '',
                                   style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),

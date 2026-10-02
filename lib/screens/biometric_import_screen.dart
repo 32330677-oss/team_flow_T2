@@ -5,6 +5,7 @@ import '../services/biometric_processing_service.dart' show BiometricApiExceptio
 import '../widgets/app_data_table.dart';
 import '../widgets/custom_app_bar.dart';
 import 'biometric_processing_screen.dart';
+import '../services/biometric_processing_service.dart' show BiometricProcessingService;
 
 class BiometricImportScreen extends StatefulWidget {
   const BiometricImportScreen({super.key});
@@ -109,6 +110,40 @@ class _BiometricImportScreenState extends State<BiometricImportScreen> {
     }
   }
 
+  Future<void> _closeStale(int batchId) async {
+    final c = TextEditingController();
+    final reason = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Close batch #$batchId'),
+        content: Column(mainAxisSize: MainAxisSize.min, children: [
+          const Text('Use this when an upload was interrupted. The punches already received become '
+              'available for processing; the batch is recorded as closed with your reason.'),
+          const SizedBox(height: 10),
+          TextField(controller: c, decoration: const InputDecoration(labelText: 'Reason (required)', border: OutlineInputBorder())),
+        ]),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          FilledButton(
+            onPressed: () {
+              if (c.text.trim().length >= 3) Navigator.pop(ctx, c.text.trim());
+            },
+            child: const Text('Close batch'),
+          ),
+        ],
+      ),
+    );
+    c.dispose();
+    if (reason == null) return;
+    try {
+      final msg = await BiometricProcessingService().closeStaleBatch(batchId, reason);
+      _snack(msg, Colors.green.shade700);
+      _load();
+    } on BiometricApiException catch (e) {
+      _snack(e.message, Colors.red);
+    }
+  }
+
   Future<void> _openDetail(ImportBatch b) async {
     try {
       final d = await _service.getBatch(b.id);
@@ -143,7 +178,19 @@ class _BiometricImportScreenState extends State<BiometricImportScreen> {
               ]),
             ),
           ),
-          actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Close'))],
+          actions: [
+            // C-14: an interrupted upload leaves the batch Pending and its
+            // punches are never processed. Closing it is audited.
+            if (d.batch.status == 'Pending')
+              TextButton(
+                onPressed: () async {
+                  Navigator.pop(ctx);
+                  await _closeStale(d.batch.id);
+                },
+                child: const Text('Close stale batch', style: TextStyle(color: Colors.red)),
+              ),
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Close')),
+          ],
         ),
       );
     } on BiometricApiException catch (e) {

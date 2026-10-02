@@ -6,6 +6,7 @@ import 'login_screen.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:intl/intl.dart';
 import 'site_attendance_screen.dart';
+import 'change_password_screen.dart';
 
 class SupervisorDashboard extends StatefulWidget {
   final int supervisorId;
@@ -116,6 +117,14 @@ class _SupervisorDashboardState extends State<SupervisorDashboard> {
                   context,
                   MaterialPageRoute(builder: (_) => const TransferRequestScreen()),
                 );
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.lock_reset_rounded, color: Color(0xff1a2a6c)),
+              title: const Text('Change Password', style: TextStyle(fontWeight: FontWeight.w600)),
+              onTap: () {
+                Navigator.pop(context);
+                Navigator.push(context, MaterialPageRoute(builder: (_) => const ChangePasswordScreen()));
               },
             ),
             const Divider(),

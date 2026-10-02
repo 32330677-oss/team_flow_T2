@@ -1,3193 +1,1504 @@
-import 'package:flutter/material.dart';
-import 'package:team_flow/constants.dart';
 import 'package:dio/dio.dart';
-import '../widgets/app_data_table.dart';
-import 'rejected_records_screen.dart';
+import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
+import 'package:team_flow/constants.dart';
 
-// في تعريف الـ Widget، أضف الحقل الجديد:
+import '../widgets/help_tip.dart';
+import 'rejected_records_screen.dart';
+
+/// Supervisor daily attendance for ONE site + shift.
+///
+/// Redesigned (2026-10):
+///  * one clear day header (previous / next day, calendar, Today) — future
+///    dates cannot be opened;
+///  * banners that explain WHY something is blocked (payroll locked, previous
+///    week still in Draft, day already submitted);
+///  * counters that double as filters, plus search;
+///  * one card per worker with the next logical action as a button and the
+///    rest in a menu; selection for bulk actions in a bottom bar;
+///  * check-in time is always on the selected date; check-out / break end can
+///    be on the next calendar day (night shift);
+///  * a readiness line under the Submit button lists what is still missing.
 class SiteAttendanceScreen extends StatefulWidget {
   final int siteId;
   final String siteName;
-  final String shiftType; // 'Day' أو 'Night' — إلزامي الآن
+  final String shiftType; // 'Day' or 'Night'
 
   const SiteAttendanceScreen({
     super.key,
     required this.siteId,
     required this.siteName,
-    this.shiftType = 'Day', // افتراضي للمواقع القديمة غير الشيفتية
+    this.shiftType = 'Day',
   });
 
   @override
-  _SiteAttendanceScreenState createState() => _SiteAttendanceScreenState();
+  State<SiteAttendanceScreen> createState() => _SiteAttendanceScreenState();
 }
 
+enum _Filter { all, notRecorded, working, onBreak, checkedOut, leave, submitted, rejected, flagged }
+
 class _SiteAttendanceScreenState extends State<SiteAttendanceScreen> {
-  bool _isLoading = true;
-  String _recordDate = DateFormat('yyyy-MM-dd').format(DateTime.now());
+  static const Color _primary = Color(0xff1a2a6c);
 
-  final Set<int> _selectedWorkerIds = <int>{};
+  bool _initialLoading = true;
+  bool _busy = false;
+  String? _loadError;
+  late String _recordDate;
+  String _businessToday = DateFormat('yyyy-MM-dd').format(DateTime.now());
 
-  List<dynamic> _workers = [];
-  List<dynamic> _mySitesForTransfer = [];
+  List<Map<String, dynamic>> _workers = [];
+  Map<String, dynamic> _day = {};
+  final Set<int> _selected = <int>{};
+  _Filter _filter = _Filter.all;
+  final TextEditingController _search = TextEditingController();
+  String _query = '';
 
-  // bool
-  TimeOfDay? _defaultLunchStart;
-  TimeOfDay? _defaultLunchEnd;
-
+  // Lunch (bulk) state
+  TimeOfDay? _lunchStart;
+  TimeOfDay? _lunchEnd;
   final Map<int, Map<String, TimeOfDay>> _lunchOverrides = {};
-  final Set<int> _lunchExcludedWorkerIds = <int>{};
-
-  final TextEditingController _searchController = TextEditingController();
-  String _searchQuery = '';
+  final Set<int> _lunchExcluded = <int>{};
 
   @override
   void initState() {
     super.initState();
-    _fetchWorkers();
+    _recordDate = _businessToday;
+    _load(initial: true);
   }
-
-Future<void> _fetchWorkers() async {
-  if (!mounted) return;
-  setState(() => _isLoading = true);
-  try {
-    final response = await ApiConfig.dio.get(
-      '/attendance/sites/${widget.siteId}/workers',
-      queryParameters: {
-        'record_date': _recordDate,
-        'shift_type': widget.shiftType, // ← جديد
-      },
-    );
-    if (!mounted) return;
-    setState(() {
-      _workers = response.data['data'] ?? [];
-      _lunchExcludedWorkerIds.clear();
-      _lunchOverrides.clear();
-      _isLoading = false;
-    });
-  } catch (e) {
-    if (!mounted) return;
-    setState(() => _isLoading = false);
-    _showToast('Failed to load workers', Colors.red);
-  }
-}
-
-  List<dynamic> get _lunchEligibleWorkers {
-    return _workers.where((w) {
-      final workflow = w['workflow_status']?.toString();
-      final isDraft = workflow == null || workflow == 'Draft';
-
-      return isDraft &&
-          w['check_in_time'] != null &&
-          w['check_out_time'] != null;
-    }).toList();
-  }
-
-  List<dynamic> get _filteredWorkers {
-    if (_searchQuery.trim().isEmpty) return _workers;
-
-    final q = _searchQuery.trim().toLowerCase();
-
-    return _workers
-        .where(
-          (w) => (w['full_name'] ?? '')
-              .toString()
-              .toLowerCase()
-              .contains(q),
-        )
-        .toList();
-  }
-
- Future<void> _handleAction(
-  String endpoint,
-  int workerId, {
-  Map<String, dynamic>? extraData,
-}) async {
-  if (!mounted) return;
-  setState(() => _isLoading = true);
-  try {
-    final Map<String, dynamic> payload = {
-      'worker_id': workerId,
-      'site_id': widget.siteId,
-      'record_date': _recordDate,
-      'shift_type': widget.shiftType, // ← جديد
-    };
-    if (extraData != null) payload.addAll(extraData);
-    await ApiConfig.dio.post(endpoint, data: payload);
-    await _fetchWorkers();
-  } on DioException catch (e) {
-    if (!mounted) return;
-    setState(() => _isLoading = false);
-    final data = e.response?.data;
-    final msg = data is Map && data['message'] != null ? data['message'].toString() : 'Connection error';
-    _showToast(msg, Colors.red);
-  } catch (e) {
-    if (!mounted) return;
-    setState(() => _isLoading = false);
-    _showToast('Connection error', Colors.red);
-  }
-}
 
   @override
   void dispose() {
-    _searchController.dispose();
+    _search.dispose();
     super.dispose();
   }
 
-  Future<void> _editTimesDialog(Map worker) async {
-    final attendanceId = worker['attendance_id'];
+  // ---------------------------------------------------------------- data
 
-    if (attendanceId == null) {
-      _showToast(
-        'No attendance record to edit yet.',
-        Colors.orange,
-      );
-      return;
-    }
+  int _id(Map w) => int.tryParse(w['worker_id'].toString()) ?? 0;
 
-    DateTime? newCheckIn = worker['check_in_time'] != null
-        ? DateTime.tryParse(
-            worker['check_in_time']
-                .toString()
-                .replaceFirst(' ', 'T'),
-          )
-        : null;
-
-    DateTime? newCheckOut = worker['check_out_time'] != null
-        ? DateTime.tryParse(
-            worker['check_out_time']
-                .toString()
-                .replaceFirst(' ', 'T'),
-          )
-        : null;
-
-    final result = await showDialog<Map<String, DateTime?>>(
-      context: context,
-      builder: (dialogContext) => StatefulBuilder(
-        builder: (context, setDialogState) => AlertDialog(
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(16),
-          ),
-          title: Text(
-            'Edit Times — ${worker['full_name'] ?? ''}',
-          ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              ListTile(
-                contentPadding: EdgeInsets.zero,
-                title: const Text('Check-in'),
-                subtitle: Text(
-                  newCheckIn == null
-                      ? 'Not set'
-                      : DateFormat(
-                          'yyyy-MM-dd HH:mm',
-                        ).format(newCheckIn!),
-                ),
-                trailing: const Icon(
-                  Icons.edit,
-                  size: 18,
-                ),
-                onTap: () async {
-                  final picked = await _pickLocalDateTime(
-                    helpText: 'Select New Check-in Time',
-                    initial: newCheckIn,
-                  );
-
-                  if (picked != null) {
-                    setDialogState(
-                      () => newCheckIn = DateTime.parse(
-                        picked.replaceFirst(' ', 'T'),
-                      ),
-                    );
-                  }
-                },
-              ),
-              ListTile(
-                contentPadding: EdgeInsets.zero,
-                title: const Text('Check-out'),
-                subtitle: Text(
-                  newCheckOut == null
-                      ? 'Not set'
-                      : DateFormat(
-                          'yyyy-MM-dd HH:mm',
-                        ).format(newCheckOut!),
-                ),
-                trailing: const Icon(
-                  Icons.edit,
-                  size: 18,
-                ),
-                onTap: () async {
-                  final picked = await _pickLocalDateTime(
-                    helpText: 'Select New Check-out Time',
-                    initial: newCheckOut,
-                  );
-
-                  if (picked != null) {
-                    setDialogState(
-                      () => newCheckOut = DateTime.parse(
-                        picked.replaceFirst(' ', 'T'),
-                      ),
-                    );
-                  }
-                },
-              ),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext),
-              child: const Text('Cancel'),
-            ),
-            ElevatedButton(
-              onPressed: () => Navigator.pop(
-                dialogContext,
-                {
-                  'checkIn': newCheckIn,
-                  'checkOut': newCheckOut,
-                },
-              ),
-              child: const Text('Save'),
-            ),
-          ],
-        ),
-      ),
-    );
-
-    if (result == null) return;
-
- final payload = <String, dynamic>{
-      'shift_type': widget.shiftType, // ← أضفها هنا
-    };
-
-    if (result['checkIn'] != null) {
-      payload['check_in_time'] = DateFormat(
-        'yyyy-MM-dd HH:mm:ss',
-      ).format(result['checkIn']!);
-    }
-
-    if (result['checkOut'] != null) {
-      payload['check_out_time'] = DateFormat(
-        'yyyy-MM-dd HH:mm:ss',
-      ).format(result['checkOut']!);
-    }
-
-    try {
-      await ApiConfig.dio.patch(
-        '/attendance/$attendanceId/edit-times',
-        data: payload,
-      );
-
-      await _fetchWorkers();
-
-      if (mounted) {
-        _showToast(
-          'Times updated successfully.',
-          Colors.green,
-        );
-      }
-    } on DioException catch (e) {
-      final data = e.response?.data;
-
-      _showToast(
-        data is Map && data['message'] != null
-            ? data['message'].toString()
-            : 'Failed to update times.',
-        Colors.red,
-      );
-    }
-  }
-
-  Future<void> _chooseAttendanceDate() async {
-    final current = DateTime.parse(_recordDate);
-
-    final selected = await showDatePicker(
-      context: context,
-      initialDate: current,
-      firstDate: DateTime(2020),
-      lastDate: DateTime(2100),
-      helpText: 'Select attendance date',
-    );
-
-    if (selected == null || !mounted) return;
-
+  Future<void> _load({bool initial = false}) async {
+    if (!mounted) return;
     setState(() {
-      _recordDate = DateFormat(
-        'yyyy-MM-dd',
-      ).format(selected);
-
-      _selectedWorkerIds.clear();
+      if (initial) _initialLoading = true;
+      _busy = !initial;
+      _loadError = null;
     });
-
-    await _fetchWorkers();
-  }
-
-  void _setRecordDateFromManualDateTime(String value) {
-    final parsed = DateTime.tryParse(value);
-
-    if (parsed == null) return;
-
-    final nextDate = DateFormat(
-      'yyyy-MM-dd',
-    ).format(parsed);
-
-    if (nextDate != _recordDate && mounted) {
-      setState(() => _recordDate = nextDate);
-    }
-  }
-
-bool _canBulkCheckIn(Map worker) {
-  final workflow = worker['workflow_status']?.toString();
-  final isDraft = workflow == null || workflow == 'Draft';
-  if (!isDraft) return false;
-
-  // لا تعتبره "مؤهل" للـ bulk check-in إذا أصلاً مسجل عليه حالة صريحة
-  // (Absent/Sick/Vacation/Holiday) ولسا ما دخل. هيك ما بينحط تشيك عليه
-  // تلقائياً من "Select Eligible"، وما بيتغير حاله إلا لو السوبرفايزر
-  // بيدوس عليه بايدو من القائمة الفردية.
-  final attendanceStatus = worker['attendance_status']?.toString();
-  final hasExplicitNonPresentStatus = worker['check_in_time'] == null &&
-      attendanceStatus != null &&
-      attendanceStatus != 'Present';
-
-  return !hasExplicitNonPresentStatus;
-}
-
-  bool _canBulkCheckOut(Map worker) {
-    final workflow = worker['workflow_status']?.toString();
-
-    return workflow == 'Draft' &&
-        worker['check_in_time'] != null &&
-        worker['check_out_time'] == null;
-  }
-bool _canBulkAbsent(Map worker) {
-  final workflow = worker['workflow_status']?.toString();
-  final isDraft = workflow == null || workflow == 'Draft';
-
-  return isDraft &&
-      worker['check_in_time'] == null &&
-      worker['check_out_time'] == null;
-}
-
-List<int> _eligibleSelectedWorkerIdsForAbsent() {
-  return _workers
-      .where((worker) {
-        final id = int.tryParse(worker['worker_id'].toString());
-        if (id == null || !_selectedWorkerIds.contains(id)) return false;
-        return _canBulkAbsent(worker);
-      })
-      .map<int>((worker) => int.parse(worker['worker_id'].toString()))
-      .toList();
-}
-  List<int> _eligibleSelectedWorkerIds(bool checkIn) {
-    return _workers
-        .where((worker) {
-          final id = int.tryParse(
-            worker['worker_id'].toString(),
-          );
-
-          if (id == null ||
-              !_selectedWorkerIds.contains(id)) {
-            return false;
-          }
-
-          return checkIn
-              ? _canBulkCheckIn(worker) &&
-                  worker['check_in_time'] == null
-              : _canBulkCheckOut(worker);
-        })
-        .map<int>(
-          (worker) => int.parse(
-            worker['worker_id'].toString(),
-          ),
-        )
-        .toList();
-  }
-
-Future<void> _bulkAttendanceAction({required bool checkIn}) async {
-  final workerIds = _eligibleSelectedWorkerIds(checkIn);
-  if (workerIds.isEmpty) {
-    _showToast(
-      checkIn ? 'Select workers who are not checked in.' : 'Select workers who are checked in and not checked out.',
-      Colors.orange,
-    );
-    return;
-  }
-  final selectedDateTime = await _pickLocalDateTime(
-    helpText: checkIn ? 'Select Bulk Check-In Time' : 'Select Bulk Check-Out Time',
-  );
-  if (selectedDateTime == null) return;
-  if (checkIn) _setRecordDateFromManualDateTime(selectedDateTime);
-
-  setState(() => _isLoading = true);
-  try {
-    final response = await ApiConfig.dio.post(
-      checkIn ? '/attendance/bulk/checkin' : '/attendance/bulk/checkout',
-      data: {
-        'site_id': widget.siteId,
-        'shift_type': widget.shiftType, // ← جديد
-        'record_date': _recordDate,
-        'worker_ids': workerIds,
-        checkIn ? 'check_in_time'
-            : 'check_out_time': selectedDateTime,
-      },
-    );
-
-    final data = response.data is Map
-        ? response.data as Map
-        : <String, dynamic>{};
-
-    final successful =
-        (data['successful'] as List?)?.length ?? 0;
-
-    if (mounted) {
-      setState(() {
-        _selectedWorkerIds.removeAll(workerIds);
-        _isLoading = false;
-      });
-
-      _showToast(
-        '$successful workers updated successfully.',
-        Colors.green,
-      );
-    }
-
-    await _fetchWorkers();
-  } on DioException catch (e) {
-    if (!mounted) return;
-
-    setState(() => _isLoading = false);
-
-    final data = e.response?.data;
-
-    _showToast(
-      data is Map && data['message'] != null
-          ? data['message'].toString()
-          : 'Bulk attendance action failed. No changes were saved.',
-      Colors.red,
-    );
-  }
-}
-
-Future<void> _bulkMarkAbsent() async {
-  final workerIds = _eligibleSelectedWorkerIdsForAbsent();
-
-  if (workerIds.isEmpty) {
-    _showToast(
-      'Select workers who have not checked in and are not already submitted.',
-      Colors.orange,
-    );
-    return;
-  }
-
-  final selectedNames = _workers
-      .where((w) => workerIds.contains(int.tryParse(w['worker_id'].toString())))
-      .map((w) => w['full_name']?.toString() ?? 'Worker')
-      .toList();
-
-  // ---- تأكيد صريح + عرض الأسماء المحددة (بس اللي عليهم check) ----
-  final confirm = await showDialog<bool>(
-    context: context,
-    builder: (context) => AlertDialog(
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-      title: Row(
-        children: const [
-          Icon(Icons.person_off_rounded, color: Colors.red),
-          SizedBox(width: 8),
-          Text('Confirm Bulk Absence'),
-        ],
-      ),
-      content: SingleChildScrollView(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              'You are about to mark ${workerIds.length} worker(s) as ABSENT for $_recordDate:',
-              style: const TextStyle(fontWeight: FontWeight.w600),
-            ),
-            const SizedBox(height: 10),
-            ...selectedNames.map(
-              (name) => Padding(
-                padding: const EdgeInsets.only(bottom: 4),
-                child: Row(
-                  children: [
-                    const Icon(Icons.circle, size: 6, color: Colors.red),
-                    const SizedBox(width: 8),
-                    Expanded(child: Text(name)),
-                  ],
-                ),
-              ),
-            ),
-            const SizedBox(height: 10),
-            Text(
-              'This action cannot be applied to workers who already checked in.',
-              style: TextStyle(fontSize: 11.5, color: Colors.grey.shade600),
-            ),
-          ],
-        ),
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(context, false),
-          child: const Text('Cancel'),
-        ),
-        ElevatedButton(
-          style: ElevatedButton.styleFrom(backgroundColor: Colors.red.shade700),
-          onPressed: () => Navigator.pop(context, true),
-          child: const Text('Mark Absent', style: TextStyle(color: Colors.white)),
-        ),
-      ],
-    ),
-  );
-
-  if (confirm != true) return;
-
-  setState(() => _isLoading = true);
-
-  try {
-final response = await ApiConfig.dio.post(
-  '/attendance/bulk/status',
-  data: {
-    'site_id': widget.siteId,
-    'shift_type': widget.shiftType, // ← جديد
-    'record_date': _recordDate,
-    'worker_ids': workerIds,
-    'attendance_status': 'Absent',
-  },
-);
-    final data = response.data is Map ? response.data as Map : <String, dynamic>{};
-    final successful = (data['successful'] as List?)?.length ?? workerIds.length;
-
-    if (mounted) {
-      setState(() {
-        _selectedWorkerIds.removeAll(workerIds);
-        _isLoading = false;
-      });
-      _showToast('$successful worker(s) marked as Absent.', Colors.red.shade700);
-    }
-
-    await _fetchWorkers();
-  } on DioException catch (e) {
-    if (!mounted) return;
-    setState(() => _isLoading = false);
-    final data = e.response?.data;
-    _showToast(
-      data is Map && data['message'] != null
-          ? data['message'].toString()
-          : 'Bulk absence action failed. No changes were saved.',
-      Colors.red,
-    );
-  }
-}
-  void _showToast(
-    String message,
-    Color color,
-  ) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(message),
-        backgroundColor: color,
-        behavior: SnackBarBehavior.floating,
-      ),
-    );
-  }
-
-  Future<void> _showAttendanceStatusDialog(
-    int workerId, {
-    String? currentStatus,
-  }) async {
-    final selectedStatus = await showDialog<String>(
-      context: context,
-      builder: (dialogContext) => SimpleDialog(
-        title: const Text(
-          'Set Worker Status',
-        ),
-        children: [
-          _statusOption(
-            dialogContext,
-            'Absent',
-            'Absent',
-            Icons.person_off,
-            Colors.red,
-          ),
-          _statusOption(
-            dialogContext,
-            'Sick',
-            'Sick Leave',
-            Icons.sick,
-            Colors.orange,
-          ),
-          _statusOption(
-            dialogContext,
-            'Vacation',
-            'Annual Leave',
-            Icons.beach_access,
-            Colors.blue,
-          ),
-          _statusOption(
-            dialogContext,
-            'Holiday',
-            'Holiday',
-            Icons.event,
-            Colors.purple,
-          ),
-        ],
-      ),
-    );
-
-    if (selectedStatus == null || !mounted) return;
-
-    await _handleAction(
-      '/attendance/status',
-      workerId,
-      extraData: {
-        'attendance_status': selectedStatus,
-        'remarks':
-            '$selectedStatus - recorded by supervisor',
-      },
-    );
-  }
-
-  Widget _statusOption(
-    BuildContext context,
-    String value,
-    String label,
-    IconData icon,
-    Color color,
-  ) {
-    return SimpleDialogOption(
-      onPressed: () => Navigator.pop(
-        context,
-        value,
-      ),
-      child: Row(
-        children: [
-          Icon(
-            icon,
-            color: color,
-          ),
-          const SizedBox(width: 12),
-          Text(
-            label,
-            style: const TextStyle(
-              fontSize: 15,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  // Sends a local wall-clock datetime without UTC conversion.
-  // The date is selected explicitly so a night shift can end after midnight.
-  Future<String?> _pickLocalDateTime({
-    required String helpText,
-    DateTime? initial,
-  }) async {
-    final seed = initial ?? DateTime.parse(
-      _recordDate,
-    );
-
-    final selectedDate = await showDatePicker(
-      context: context,
-      initialDate: DateTime(
-        seed.year,
-        seed.month,
-        seed.day,
-      ),
-      firstDate: DateTime(
-        seed.year,
-        seed.month,
-        seed.day,
-      ).subtract(
-        const Duration(days: 1),
-      ),
-      lastDate: DateTime(
-        seed.year,
-        seed.month,
-        seed.day,
-      ).add(
-        const Duration(days: 2),
-      ),
-      helpText: 'Select date',
-    );
-
-    if (selectedDate == null || !mounted) {
-      return null;
-    }
-
-    final selectedTime = await showTimePicker(
-      context: context,
-      initialTime: TimeOfDay.fromDateTime(
-        seed,
-      ),
-      helpText: helpText,
-    );
-
-    if (selectedTime == null) return null;
-
-    // Deliberately omit Z/toUtc():
-    // backend stores supervisor-selected local time.
-    return DateFormat(
-      'yyyy-MM-dd HH:mm:ss',
-    ).format(
-      DateTime(
-        selectedDate.year,
-        selectedDate.month,
-        selectedDate.day,
-        selectedTime.hour,
-        selectedTime.minute,
-      ),
-    );
-  }
-
-  // -------------------------------------------------------------------
-  // Opens a manual picker and sends a literal local wall-clock datetime.
-  // The selected shift date is propagated separately as record_date.
- Future<void> _performCheckIn(
-    int workerId,
-  ) async {
-    final selectedDateTime = await _pickLocalDateTime(
-      helpText: 'Select Check-In Time',
-    );
-
-    if (selectedDateTime == null) return;
-
-    _setRecordDateFromManualDateTime(
-      selectedDateTime,
-    );
-
-    await _handleAction(
-      '/attendance/checkin',
-      workerId,
-      extraData: {
-        'check_in_time': selectedDateTime,
-        'shift_type': widget.shiftType, // ← تأكد من إضافتها هنا أيضاً
-      },
-    );
-  }
-
-  Future<void> _performCheckOut(
-    int workerId,
-  ) async {
-    final selectedDateTime = await _pickLocalDateTime(
-      helpText: 'Select Check-Out Date and Time',
-    );
-
-    if (selectedDateTime == null) return;
-
-    await _handleAction(
-      '/attendance/checkout',
-      workerId,
-      extraData: {
-        'check_out_time': selectedDateTime,
-      },
-    );
-  }
-
-  // NEW: manual end-of-break time picker, mirrors _performCheckOut.
-  Future<void> _performEndLeave(
-    int workerId,
-  ) async {
-    final selectedDateTime = await _pickLocalDateTime(
-      helpText: 'Select Break End Date and Time',
-    );
-
-    if (selectedDateTime == null) return;
-
-    await _handleAction(
-      '/attendance/leave/end',
-      workerId,
-      extraData: {
-        'leave_end_time': selectedDateTime,
-      },
-    );
-  }
-
-  // -------------------------------------------------------------------
-  // UNCHANGED: leave/break type selection sheet.
-  // -------------------------------------------------------------------
-  Future<void> _startLeaveDialog(
-    int workerId,
-  ) async {
-    final type = await showModalBottomSheet<String>(
-      context: context,
-      backgroundColor: Colors.white,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(
-          top: Radius.circular(24),
-        ),
-      ),
-      builder: (ctx) => SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.all(20.0),
-          child: Wrap(
-            runSpacing: 12,
-            children: [
-              Center(
-                child: Container(
-                  width: 40,
-                  height: 4,
-                  decoration: BoxDecoration(
-                    color: Colors.grey[300],
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                ),
-              ),
-              const SizedBox(height: 8),
-              const Text(
-                'Select Break / Leave Type',
-                style: TextStyle(
-                  fontSize: 18,
-                  fontWeight: FontWeight.bold,
-                  color: Color(0xff1a2a6c),
-                ),
-              ),
-              const Divider(),
-              _buildLeaveOption(
-                ctx,
-                'Rest',
-                'Rest Break',
-                Icons.free_breakfast,
-                Colors.blue,
-              ),
-              _buildLeaveOption(
-                ctx,
-                'Lunch',
-                'Lunch Break',
-                Icons.lunch_dining,
-                Colors.purple,
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-
-    if (type == null) return;
-    if (!mounted) return;
-
-    // Select the calendar date explicitly so breaks can cross midnight safely.
-    final selectedDateTime = await _pickLocalDateTime(
-      helpText: 'Select Break Start Date and Time',
-    );
-
-    if (selectedDateTime == null) return;
-
-    await _handleAction(
-      '/attendance/leave/start',
-      workerId,
-      extraData: {
-        'leave_type': type,
-        'leave_start_time': selectedDateTime,
-      },
-    );
-  }
-
-  Widget _buildLeaveOption(
-    BuildContext ctx,
-    String value,
-    String title,
-    IconData icon,
-    Color color,
-  ) {
-    return ListTile(
-      leading: Container(
-        padding: const EdgeInsets.all(8),
-        decoration: BoxDecoration(
-          color: color.withOpacity(0.1),
-          borderRadius: BorderRadius.circular(8),
-        ),
-        child: Icon(
-          icon,
-          color: color,
-        ),
-      ),
-      title: Text(
-        title,
-        style: const TextStyle(
-          fontWeight: FontWeight.w600,
-        ),
-      ),
-      onTap: () => Navigator.pop(
-        ctx,
-        value,
-      ),
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(10),
-      ),
-    );
-  }
-
-  Future<void> _openTransferSheet(
-    Map worker,
-  ) async {
     try {
       final res = await ApiConfig.dio.get(
-        '/sites/my-sites',
+        '/attendance/sites/${widget.siteId}/workers',
+        queryParameters: {'record_date': _recordDate, 'shift_type': widget.shiftType},
       );
+      final data = res.data is Map ? res.data as Map : <String, dynamic>{};
+      final list = (data['data'] as List? ?? [])
+          .whereType<Map>()
+          .map((e) => Map<String, dynamic>.from(e))
+          .toList();
+      if (!mounted) return;
+      setState(() {
+        _workers = list;
+        _day = data['day'] is Map ? Map<String, dynamic>.from(data['day'] as Map) : <String, dynamic>{};
+        final today = _day['business_today']?.toString();
+        if (today != null && today.length == 10) _businessToday = today;
+        _selected.removeWhere((id) => !_workers.any((w) => _id(w) == id));
+        _lunchOverrides.clear();
+        _lunchExcluded.clear();
+      });
+    } on DioException catch (e) {
+      if (!mounted) return;
+      setState(() => _loadError = _msg(e, 'Failed to load workers.'));
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _loadError = 'Failed to load workers.');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _initialLoading = false;
+          _busy = false;
+        });
+      }
+    }
+  }
 
-      _mySitesForTransfer = (res.data is List)
-          ? res.data
-          : (res.data['data'] ?? []);
-    } catch (e) {
-      _showToast(
-        'Failed to load your assigned sites',
-        Colors.red,
+  String _msg(Object e, String fallback) {
+    if (e is DioException) {
+      final d = e.response?.data;
+      if (d is Map && d['message'] != null) return d['message'].toString();
+      if (e.response == null) return 'Connection error. Check your network.';
+    }
+    return fallback;
+  }
+
+  void _toast(String message, {Color color = Colors.green}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message), backgroundColor: color, behavior: SnackBarBehavior.floating),
+    );
+  }
+
+  /// Runs one API call with a non-blocking progress bar, then reloads.
+  Future<bool> _run(Future<Response<dynamic>> Function() call, {String? success}) async {
+    if (_busy) return false;
+    setState(() => _busy = true);
+    try {
+      final res = await call();
+      final data = res.data;
+      final serverMsg = data is Map && data['message'] != null ? data['message'].toString() : null;
+      await _load();
+      final flagged = serverMsg != null && serverMsg.contains('Flagged for review');
+      _toast(flagged ? serverMsg : (success ?? serverMsg ?? 'Saved.'),
+          color: flagged ? Colors.orange.shade800 : Colors.green);
+      return true;
+    } on DioException catch (e) {
+      if (mounted) setState(() => _busy = false);
+      final d = e.response?.data;
+      final code = d is Map ? d['code']?.toString() : null;
+      if (code == 'PREVIOUS_WEEK_UNSUBMITTED' || code == 'PAYROLL_PERIOD_FINALIZED') {
+        await _load();
+      }
+      _toast(_msg(e, 'Action failed. Nothing was saved.'), color: Colors.red.shade700);
+      return false;
+    } catch (_) {
+      if (mounted) setState(() => _busy = false);
+      _toast('Action failed. Nothing was saved.', color: Colors.red.shade700);
+      return false;
+    }
+  }
+
+  Map<String, dynamic> _base(int workerId) => {
+        'worker_id': workerId,
+        'site_id': widget.siteId,
+        'record_date': _recordDate,
+        'shift_type': widget.shiftType,
+      };
+
+  // ------------------------------------------------------------ state helpers
+
+  bool get _locked => _day['payroll_locked'] == true;
+  List get _prevWeekDrafts => (_day['previous_week_drafts'] as List?) ?? const [];
+
+  String? _workflow(Map w) => w['workflow_status']?.toString();
+  bool _isDraftOrNone(Map w) => _workflow(w) == null || _workflow(w) == 'Draft';
+  bool _hasIn(Map w) => w['check_in_time'] != null;
+  bool _hasOut(Map w) => w['check_out_time'] != null;
+  bool _onBreak(Map w) => w['current_leave_id'] != null;
+  bool _isLeave(Map w) {
+    final s = w['attendance_status']?.toString();
+    return w['attendance_id'] != null && s != null && s != 'Present';
+  }
+
+  /// Record that belongs to the previous calendar day (night shift still open).
+  bool _isCarryOver(Map w) {
+    final d = w['attendance_record_date']?.toString();
+    return d != null && d != _recordDate;
+  }
+
+  _Filter _categoryOf(Map w) {
+    final wf = _workflow(w);
+    if (wf == 'Rejected') return _Filter.rejected;
+    if (wf == 'Submitted' || wf == 'Approved') return _Filter.submitted;
+    if (w['attendance_id'] == null) return _Filter.notRecorded;
+    if (_isLeave(w)) return _Filter.leave;
+    if (_onBreak(w)) return _Filter.onBreak;
+    if (_hasIn(w) && !_hasOut(w)) return _Filter.working;
+    return _Filter.checkedOut;
+  }
+
+  int _count(_Filter f) {
+    if (f == _Filter.all) return _workers.length;
+    if (f == _Filter.flagged) return _workers.where((w) => w['anomaly_code'] != null).length;
+    return _workers.where((w) => _categoryOf(w) == f).length;
+  }
+
+  List<Map<String, dynamic>> get _visible {
+    final q = _query.trim().toLowerCase();
+    return _workers.where((w) {
+      if (_filter == _Filter.flagged && w['anomaly_code'] == null) return false;
+      if (_filter != _Filter.all && _filter != _Filter.flagged && _categoryOf(w) != _filter) return false;
+      if (q.isEmpty) return true;
+      final name = (w['full_name'] ?? '').toString().toLowerCase();
+      final uid = (w['worker_unique_id'] ?? '').toString().toLowerCase();
+      return name.contains(q) || uid.contains(q);
+    }).toList();
+  }
+
+  bool _canCheckIn(Map w) => !_locked && _isDraftOrNone(w) && w['attendance_id'] == null;
+  bool _canCheckOut(Map w) => !_locked && _workflow(w) == 'Draft' && _hasIn(w) && !_hasOut(w) && !_onBreak(w);
+  bool _canSetStatus(Map w) => !_locked && _isDraftOrNone(w) && !_hasIn(w) && !_hasOut(w) && !_isCarryOver(w);
+  bool _canBreak(Map w) => !_locked && _workflow(w) == 'Draft' && _hasIn(w) && !_hasOut(w);
+  bool _canEditTimes(Map w) => !_locked && _workflow(w) == 'Draft' && _hasIn(w);
+
+  // Readiness for "Submit day" (the backend re-checks everything).
+  List<String> get _blockers {
+    final out = <String>[];
+    if (_locked) out.add('payroll period locked');
+    if (_day['is_future'] == true) out.add('future date');
+    if (_prevWeekDrafts.isNotEmpty) out.add('previous week has Draft days');
+    final notRecorded = _workers.where((w) => w['attendance_id'] == null && w['active_on_date'] != false).length;
+    if (notRecorded > 0) out.add('$notRecorded not recorded');
+    final open = _workers.where((w) => _workflow(w) == 'Draft' && _hasIn(w) && !_hasOut(w)).length;
+    if (open > 0) out.add('$open still checked in');
+    final breaks = _workers.where((w) => _workflow(w) == 'Draft' && _onBreak(w)).length;
+    if (breaks > 0) out.add('$breaks on break');
+    return out;
+  }
+
+  bool get _hasDraftToSubmit => _workers.any((w) => _workflow(w) == 'Draft');
+  bool get _allSubmitted =>
+      _workers.isNotEmpty && _workers.every((w) => _workflow(w) == 'Submitted' || _workflow(w) == 'Approved');
+
+  // ------------------------------------------------------------- pickers
+
+  DateTime get _dateObj => DateTime.parse(_recordDate);
+
+  String _fmt(DateTime dt) => DateFormat('yyyy-MM-dd HH:mm:ss').format(dt);
+
+  String _hm(dynamic value) {
+    if (value == null) return '--:--';
+    final m = RegExp(r'(?:T| )(\d{2}:\d{2})').firstMatch(value.toString());
+    return m?.group(1) ?? value.toString();
+  }
+
+  String _dayLabel(dynamic value) {
+    if (value == null) return '';
+    final s = value.toString().replaceFirst('T', ' ');
+    if (s.length < 10) return '';
+    final d = s.substring(0, 10);
+    return d == _recordDate ? '' : ' (${DateFormat('d MMM').format(DateTime.parse(d))})';
+  }
+
+  /// Time on the selected attendance date (check-in, bulk check-in).
+  Future<String?> _pickTimeOnRecordDate(String help, {TimeOfDay? initial}) async {
+    final t = await showTimePicker(context: context, initialTime: initial ?? TimeOfDay.now(), helpText: help);
+    if (t == null) return null;
+    final d = _dateObj;
+    return _fmt(DateTime(d.year, d.month, d.day, t.hour, t.minute));
+  }
+
+  /// Time on the attendance date OR the next day (night shift check-out / break end).
+  Future<String?> _pickTimeSameOrNextDay(String help, {DateTime? base}) async {
+    final start = base ?? _dateObj;
+    final startDay = DateTime(start.year, start.month, start.day);
+    final nextDay = startDay.add(const Duration(days: 1));
+    DateTime chosenDay = startDay;
+    if (widget.shiftType == 'Night' || base != null) {
+      final picked = await showDialog<DateTime>(
+        context: context,
+        builder: (ctx) => SimpleDialog(
+          title: Text(help),
+          children: [
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(ctx, startDay),
+              child: ListTile(
+                leading: const Icon(Icons.today_rounded),
+                title: Text('Same day — ${DateFormat('EEE d MMM').format(startDay)}'),
+              ),
+            ),
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(ctx, nextDay),
+              child: ListTile(
+                leading: const Icon(Icons.nights_stay_rounded),
+                title: Text('Next day — ${DateFormat('EEE d MMM').format(nextDay)}'),
+                subtitle: const Text('Night shift that ends after midnight'),
+              ),
+            ),
+          ],
+        ),
       );
+      if (picked == null) return null;
+      chosenDay = picked;
+    }
+    if (!mounted) return null;
+    final t = await showTimePicker(context: context, initialTime: TimeOfDay.now(), helpText: help);
+    if (t == null) return null;
+    return _fmt(DateTime(chosenDay.year, chosenDay.month, chosenDay.day, t.hour, t.minute));
+  }
+
+  DateTime? _parse(dynamic v) => v == null ? null : DateTime.tryParse(v.toString().replaceFirst(' ', 'T'));
+
+  // ------------------------------------------------------------- actions
+
+  Future<void> _changeDate(DateTime d) async {
+    final today = DateTime.parse(_businessToday);
+    if (d.isAfter(today)) {
+      _toast('Future dates cannot be recorded.', color: Colors.orange.shade800);
       return;
     }
+    setState(() {
+      _recordDate = DateFormat('yyyy-MM-dd').format(d);
+      _selected.clear();
+    });
+    await _load();
+  }
 
+  Future<void> _pickDate() async {
+    final today = DateTime.parse(_businessToday);
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: _dateObj.isAfter(today) ? today : _dateObj,
+      firstDate: DateTime(2024),
+      lastDate: today,
+      helpText: 'Attendance date',
+    );
+    if (picked != null) await _changeDate(picked);
+  }
+
+  Future<void> _checkIn(Map w) async {
+    final t = await _pickTimeOnRecordDate('Check-in time — ${w['full_name']}');
+    if (t == null) return;
+    await _run(() => ApiConfig.dio.post('/attendance/checkin', data: {..._base(_id(w)), 'check_in_time': t}),
+        success: 'Checked in.');
+  }
+
+  Future<void> _checkOut(Map w) async {
+    final t = await _pickTimeSameOrNextDay('Check-out — ${w['full_name']}', base: _parse(w['check_in_time']));
+    if (t == null) return;
+    final recordDate = w['attendance_record_date']?.toString() ?? _recordDate;
+    await _run(() => ApiConfig.dio.post('/attendance/checkout', data: {
+          ..._base(_id(w)),
+          'record_date': recordDate,
+          'check_out_time': t,
+        }));
+  }
+
+  Future<void> _setStatus(Map w) async {
+    final status = await showDialog<String>(
+      context: context,
+      builder: (ctx) => SimpleDialog(
+        title: Text('Status — ${w['full_name']}'),
+        children: [
+          _statusOption(ctx, 'Absent', 'Absent', Icons.person_off_rounded, Colors.red),
+          _statusOption(ctx, 'Sick', 'Sick leave', Icons.sick_rounded, Colors.orange),
+          _statusOption(ctx, 'Vacation', 'Annual leave', Icons.beach_access_rounded, Colors.blue),
+          _statusOption(ctx, 'Holiday', 'Holiday', Icons.event_rounded, Colors.purple),
+        ],
+      ),
+    );
+    if (status == null) return;
+    await _run(() => ApiConfig.dio.post('/attendance/status', data: {
+          ..._base(_id(w)),
+          'attendance_status': status,
+          'remarks': '$status - recorded by supervisor',
+        }), success: 'Status saved.');
+  }
+
+  Widget _statusOption(BuildContext ctx, String value, String label, IconData icon, Color color) {
+    return SimpleDialogOption(
+      onPressed: () => Navigator.pop(ctx, value),
+      child: Row(children: [Icon(icon, color: color), const SizedBox(width: 12), Text(label, style: const TextStyle(fontSize: 15))]),
+    );
+  }
+
+  Future<void> _toggleBreak(Map w) async {
+    final recordDate = w['attendance_record_date']?.toString() ?? _recordDate;
+    if (_onBreak(w)) {
+      final t = await _pickTimeSameOrNextDay('Break end — ${w['full_name']}', base: _parse(w['check_in_time']));
+      if (t == null) return;
+      await _run(() => ApiConfig.dio.post('/attendance/leave/end',
+          data: {..._base(_id(w)), 'record_date': recordDate, 'leave_end_time': t}), success: 'Break ended.');
+      return;
+    }
+    final type = await showModalBottomSheet<String>(
+      context: context,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      builder: (ctx) => SafeArea(
+        child: Wrap(children: [
+          const ListTile(title: Text('Start a break', style: TextStyle(fontWeight: FontWeight.bold))),
+          ListTile(
+            leading: const Icon(Icons.free_breakfast_rounded, color: Colors.blue),
+            title: const Text('Rest break'),
+            subtitle: const Text('Always deducted from working hours'),
+            onTap: () => Navigator.pop(ctx, 'Rest'),
+          ),
+          ListTile(
+            leading: const Icon(Icons.lunch_dining_rounded, color: Colors.purple),
+            title: const Text('Lunch break'),
+            subtitle: const Text('Deducted unless lunch is paid (Attendance Settings)'),
+            onTap: () => Navigator.pop(ctx, 'Lunch'),
+          ),
+        ]),
+      ),
+    );
+    if (type == null) return;
+    final t = await _pickTimeSameOrNextDay('Break start — ${w['full_name']}', base: _parse(w['check_in_time']));
+    if (t == null) return;
+    await _run(() => ApiConfig.dio.post('/attendance/leave/start',
+        data: {..._base(_id(w)), 'record_date': recordDate, 'leave_type': type, 'leave_start_time': t}),
+        success: 'Break started.');
+  }
+
+  Future<void> _editTimes(Map w) async {
+    DateTime? newIn = _parse(w['check_in_time']);
+    DateTime? newOut = _parse(w['check_out_time']);
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setD) => AlertDialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          title: Text('Edit times — ${w['full_name']}'),
+          content: Column(mainAxisSize: MainAxisSize.min, children: [
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.login_rounded),
+              title: const Text('Check-in'),
+              subtitle: Text(newIn == null ? 'Not set' : DateFormat('EEE d MMM, HH:mm').format(newIn!)),
+              trailing: const Icon(Icons.edit, size: 18),
+              onTap: () async {
+                final t = await showTimePicker(
+                    context: ctx, initialTime: newIn != null ? TimeOfDay.fromDateTime(newIn!) : TimeOfDay.now());
+                if (t != null) {
+                  final base = newIn ?? _dateObj;
+                  setD(() => newIn = DateTime(base.year, base.month, base.day, t.hour, t.minute));
+                }
+              },
+            ),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.logout_rounded),
+              title: const Text('Check-out'),
+              subtitle: Text(newOut == null ? 'Not set' : DateFormat('EEE d MMM, HH:mm').format(newOut!)),
+              trailing: const Icon(Icons.edit, size: 18),
+              onTap: () async {
+                final s = await _pickTimeSameOrNextDay('Check-out', base: newIn);
+                if (s != null) setD(() => newOut = DateTime.parse(s.replaceFirst(' ', 'T')));
+              },
+            ),
+            const SizedBox(height: 6),
+            Text('The check-in stays on the attendance date. A night-shift check-out may be on the next day.',
+                style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
+          ]),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+            ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Save')),
+          ],
+        ),
+      ),
+    );
+    if (result != true) return;
+    final payload = <String, dynamic>{'shift_type': widget.shiftType};
+    if (newIn != null) payload['check_in_time'] = _fmt(newIn!);
+    if (newOut != null) payload['check_out_time'] = _fmt(newOut!);
+    await _run(() => ApiConfig.dio.patch('/attendance/${w['attendance_id']}/edit-times', data: payload),
+        success: 'Times updated.');
+  }
+
+  // ------------------------------------------------------------- bulk
+
+  List<int> _eligible(bool Function(Map) test) =>
+      _workers.where((w) => _selected.contains(_id(w)) && test(w)).map(_id).toList();
+
+  Future<void> _bulkCheckIn() async {
+    final ids = _eligible(_canCheckIn);
+    if (ids.isEmpty) return _toast('None of the selected workers can be checked in.', color: Colors.orange.shade800);
+    final t = await _pickTimeOnRecordDate('Check-in time for ${ids.length} worker(s)');
+    if (t == null) return;
+    final ok = await _run(() => ApiConfig.dio.post('/attendance/bulk/checkin', data: {
+          'site_id': widget.siteId, 'shift_type': widget.shiftType, 'record_date': _recordDate,
+          'worker_ids': ids, 'check_in_time': t,
+        }), success: '${ids.length} worker(s) checked in.');
+    if (ok) setState(_selected.clear);
+  }
+
+  Future<void> _bulkCheckOut() async {
+    final ids = _eligible(_canCheckOut);
+    if (ids.isEmpty) return _toast('None of the selected workers has an open shift.', color: Colors.orange.shade800);
+    final t = await _pickTimeSameOrNextDay('Check-out time for ${ids.length} worker(s)');
+    if (t == null) return;
+    final ok = await _run(() => ApiConfig.dio.post('/attendance/bulk/checkout', data: {
+          'site_id': widget.siteId, 'shift_type': widget.shiftType, 'record_date': _recordDate,
+          'worker_ids': ids, 'check_out_time': t,
+        }), success: '${ids.length} worker(s) checked out.');
+    if (ok) setState(_selected.clear);
+  }
+
+  Future<void> _bulkAbsent() async {
+    final ids = _eligible(_canSetStatus);
+    if (ids.isEmpty) return _toast('Only workers without clock activity can be marked absent.', color: Colors.orange.shade800);
+    final names = _workers.where((w) => ids.contains(_id(w))).map((w) => w['full_name'].toString()).toList();
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Mark absent?'),
+        content: SingleChildScrollView(
+          child: Text('${ids.length} worker(s) will be marked ABSENT on ${DateFormat('EEE d MMM yyyy').format(_dateObj)}:\n\n• ${names.join('\n• ')}'),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.red.shade700, foregroundColor: Colors.white),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Mark absent'),
+          ),
+        ],
+      ),
+    );
+    if (confirm != true) return;
+    final ok = await _run(() => ApiConfig.dio.post('/attendance/bulk/status', data: {
+          'site_id': widget.siteId, 'shift_type': widget.shiftType, 'record_date': _recordDate,
+          'worker_ids': ids, 'attendance_status': 'Absent',
+        }), success: '${ids.length} worker(s) marked absent.');
+    if (ok) setState(_selected.clear);
+  }
+
+  // ------------------------------------------------------------- lunch
+
+  List<Map<String, dynamic>> get _lunchEligible =>
+      _workers.where((w) => _workflow(w) == 'Draft' && _hasIn(w) && _hasOut(w)).toList();
+
+  String _t(TimeOfDay? t) =>
+      t == null ? '--:--' : '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
+
+  Future<void> _saveLunch() async {
+    final eligible = _lunchEligible.map(_id).toSet();
+    final included = eligible.difference(_lunchExcluded);
+    if (included.isEmpty) return _toast('Every worker is excluded — nothing to save.', color: Colors.orange.shade800);
+    final hasDefault = _lunchStart != null && _lunchEnd != null;
+    if (!hasDefault && included.any((id) => _lunchOverrides[id] == null)) {
+      return _toast('Set the default lunch time, or a custom time for every included worker.', color: Colors.orange.shade800);
+    }
+    final overrides = <String, dynamic>{};
+    _lunchOverrides.forEach((id, v) {
+      overrides['$id'] = {'start_time': _t(v['start']), 'end_time': _t(v['end'])};
+    });
+    await _run(() => ApiConfig.dio.post('/attendance/lunch/bulk', data: {
+          'siteId': widget.siteId,
+          'shift_type': widget.shiftType,
+          'date': _recordDate,
+          'default_start_time': hasDefault ? _t(_lunchStart) : null,
+          'default_end_time': hasDefault ? _t(_lunchEnd) : null,
+          'overrides': overrides,
+          'excluded_worker_ids': _lunchExcluded.toList(),
+        }));
+  }
+
+  // ------------------------------------------------------------- submit
+
+  Future<void> _submitDay({List<Map<String, dynamic>>? lunchSkips}) async {
+    if (lunchSkips == null) {
+      final confirm = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Submit the day for review?'),
+          content: Text(
+              'All Draft records of ${widget.siteName} (${widget.shiftType}) on ${DateFormat('EEE d MMM yyyy').format(_dateObj)} '
+              'will be sent to the Admin. After submitting you can no longer change them; the Admin approves or rejects them.'),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+            ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Submit')),
+          ],
+        ),
+      );
+      if (confirm != true) return;
+    }
+    setState(() => _busy = true);
+    try {
+      final res = await ApiConfig.dio.post('/attendance/submit', data: {
+        'siteId': widget.siteId,
+        'shift_type': widget.shiftType,
+        'record_date': _recordDate,
+        if (lunchSkips != null) 'lunch_decisions': lunchSkips,
+      });
+      final data = res.data is Map ? res.data as Map : <String, dynamic>{};
+      if (data['requires_confirmation'] == true) {
+        setState(() => _busy = false);
+        final missing = (data['missing_workers'] as List? ?? []).whereType<Map>().toList();
+        final skips = await _askLunchReasons(missing);
+        if (skips != null) await _submitDay(lunchSkips: skips);
+        return;
+      }
+      await _load();
+      _toast('Day submitted: ${data['submitted_records'] ?? 0} record(s) sent for review.');
+    } on DioException catch (e) {
+      setState(() => _busy = false);
+      final d = e.response?.data;
+      if (d is Map && d['code'] == 'MISSING_ATTENDANCE_RECORDS') {
+        final names = (d['missing_workers'] as List? ?? []).whereType<Map>().map((m) => m['full_name']).join(', ');
+        await HelpTip.show(context, 'Attendance is incomplete',
+            'Record Present (check-in/out), Absent, Sick, Vacation or Holiday for every assigned worker first:\n\n$names');
+        setState(() => _filter = _Filter.notRecorded);
+        return;
+      }
+      if (d is Map && d['open_workers'] is List) {
+        final names = (d['open_workers'] as List).whereType<Map>().map((m) => m['full_name']).join(', ');
+        await HelpTip.show(context, 'Shifts still open', '${d['message']}\n\n$names');
+        return;
+      }
+      await _load();
+      _toast(_msg(e, 'Submission failed.'), color: Colors.red.shade700);
+    }
+  }
+
+  Future<List<Map<String, dynamic>>?> _askLunchReasons(List<Map> missing) async {
+    final decisions = <dynamic, bool>{};
+    final reasons = {for (final m in missing) m['attendance_id']: TextEditingController()};
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setD) => AlertDialog(
+          title: const Text('No lunch recorded'),
+          content: SizedBox(
+            width: 460,
+            child: SingleChildScrollView(
+              child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+                const Text('For each worker: did they work through lunch? If yes, give a reason (it becomes overtime). '
+                    'If not, the site lunch period is deducted.', style: TextStyle(fontSize: 13)),
+                const SizedBox(height: 12),
+                ...missing.map((m) {
+                  final id = m['attendance_id'];
+                  final worked = decisions[id] ?? false;
+                  return Padding(
+                    padding: const EdgeInsets.only(bottom: 12),
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Text('${m['full_name']}', style: const TextStyle(fontWeight: FontWeight.w600)),
+                      Row(children: [
+                        ChoiceChip(
+                          label: const Text('Did not work lunch'),
+                          selected: !worked,
+                          onSelected: (_) => setD(() => decisions[id] = false),
+                        ),
+                        const SizedBox(width: 8),
+                        ChoiceChip(
+                          label: const Text('Worked through lunch'),
+                          selected: worked,
+                          onSelected: (_) => setD(() => decisions[id] = true),
+                        ),
+                      ]),
+                      if (worked)
+                        TextField(
+                          controller: reasons[id],
+                          decoration: const InputDecoration(labelText: 'Reason (required)', isDense: true),
+                        ),
+                    ]),
+                  );
+                }),
+              ]),
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+            ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Confirm & submit')),
+          ],
+        ),
+      ),
+    );
+    if (ok != true) return null;
+    final result = <Map<String, dynamic>>[];
+    for (final m in missing) {
+      final id = m['attendance_id'];
+      final worked = decisions[id] ?? false;
+      final reason = reasons[id]!.text.trim();
+      if (worked && reason.isEmpty) {
+        _toast('A reason is required for ${m['full_name']}.', color: Colors.orange.shade800);
+        return null;
+      }
+      result.add({'attendance_id': id, 'worked_through_lunch': worked, 'reason': reason});
+    }
+    // Sent as lunch_decisions: each item says explicitly whether the worker
+    // worked through lunch (true) or took it (false). confirmed_lunch_skips
+    // would treat every item that has a reason as "worked through".
+    return result;
+  }
+
+  // ------------------------------------------------------------- transfer
+
+  Future<void> _transfer(Map w) async {
+    List sites = [];
+    try {
+      final res = await ApiConfig.dio.get('/sites/all-sites');
+      sites = res.data is Map ? (res.data['data'] as List? ?? []) : (res.data as List? ?? []);
+    } catch (e) {
+      return _toast('Failed to load sites.', color: Colors.red.shade700);
+    }
     if (!mounted) return;
-
-    Map? selectedTargetSite;
-    bool isSubmitting = false;
-
+    Map? target;
+    String targetShift = 'Day';
+    DateTime effective = DateTime.parse(_businessToday);
+    final reason = TextEditingController();
+    bool sending = false;
     await showModalBottomSheet(
       context: context,
       isScrollControlled: true,
-      backgroundColor: Colors.white,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(
-          top: Radius.circular(24),
-        ),
-      ),
-      builder: (sheetContext) => StatefulBuilder(
-        builder: (context, setModalState) => Padding(
-          padding: EdgeInsets.only(
-            bottom:
-                MediaQuery.of(context).viewInsets.bottom + 20,
-            top: 20,
-            left: 20,
-            right: 20,
-          ),
-          child: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment:
-                  CrossAxisAlignment.stretch,
-              children: [
-                Center(
-                  child: Container(
-                    width: 40,
-                    height: 4,
-                    decoration: BoxDecoration(
-                      color: Colors.grey[300],
-                      borderRadius:
-                          BorderRadius.circular(10),
-                    ),
-                  ),
-                ),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      builder: (sheet) => StatefulBuilder(
+        builder: (sheet, setS) {
+          final supportsShifts = target != null && (target!['supports_shifts'] == 1 || target!['supports_shifts'] == true);
+          final sameAsCurrent = target != null &&
+              int.tryParse(target!['site_id'].toString()) == widget.siteId &&
+              targetShift == widget.shiftType;
+          return Padding(
+            padding: EdgeInsets.fromLTRB(20, 20, 20, MediaQuery.of(sheet).viewInsets.bottom + 20),
+            child: SingleChildScrollView(
+              child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, mainAxisSize: MainAxisSize.min, children: [
+                Text('Transfer request — ${w['full_name']}',
+                    style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: _primary)),
+                const SizedBox(height: 4),
+                Text('From ${widget.siteName} (${widget.shiftType}). The Admin approves the request.',
+                    style: TextStyle(color: Colors.grey.shade600)),
                 const SizedBox(height: 16),
-                Text(
-                  'Transfer Worker: ${worker['full_name'] ?? ''}',
-                  style: const TextStyle(
-                    fontSize: 18,
-                    fontWeight: FontWeight.bold,
-                    color: Color(0xff1a2a6c),
-                  ),
-                  textAlign: TextAlign.center,
-                ),
-                const SizedBox(height: 6),
-            Text(
-  'Current Shift: ${widget.shiftType}',
-  style: TextStyle(
-    fontSize: 13,
-    color: Colors.grey.shade600,
-  ),
-  textAlign: TextAlign.center,
-),
-                const SizedBox(height: 20),
-                if (_mySitesForTransfer
-                    .where(
-                      (s) => s['site_id'] != widget.siteId,
-                    )
-                    .isEmpty)
-                  const Padding(
-                    padding:
-                        EdgeInsets.symmetric(vertical: 20),
-                    child: Text(
-                      'No other assigned sites available for transfer',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                        color: Colors.grey,
-                      ),
-                    ),
-                  )
-                else
-                  DropdownButtonFormField<Map>(
-                    decoration: InputDecoration(
-                      labelText: 'Select Target Site',
-                      border: OutlineInputBorder(
-                        borderRadius:
-                            BorderRadius.circular(12),
-                      ),
-                      prefixIcon: const Icon(
-                        Icons.location_on,
-                        color: Color(0xff1a2a6c),
-                      ),
-                    ),
-                    value: selectedTargetSite,
-                    items: _mySitesForTransfer
-                        .where(
-                          (s) =>
-                              s['site_id'] != widget.siteId,
-                        )
-                        .map<DropdownMenuItem<Map>>(
-                          (s) => DropdownMenuItem<Map>(
-                            value: s,
-                            child: Text(
-                              s['site_name'] ?? '',
-                            ),
-                          ),
-                        )
-                        .toList(),
-                    onChanged: (value) =>
-                        setModalState(
-                      () => selectedTargetSite = value,
-                    ),
-                  ),
-                const SizedBox(height: 24),
-                ElevatedButton.icon(
-                  onPressed:
-                      (selectedTargetSite == null ||
-                              isSubmitting)
-                          ? null
-                          : () async {
-                              setModalState(
-                                () => isSubmitting = true,
-                              );
-
-                              try {
-                                await ApiConfig.dio.post(
-                                  '/transfers',
-                                data: {
-  'worker_id':
-      worker['worker_id'],
-  'current_site_id':
-      widget.siteId,
-  'current_shift_type':
-      widget.shiftType,
-  'target_site_id':
-      selectedTargetSite!['site_id'],
-},
-                                );
-
-                                if (!mounted) return;
-
-                                Navigator.pop(
-                                  sheetContext,
-                                );
-
-                                await _fetchWorkers();
-
-                                if (!mounted) return;
-
-                                _showToast(
-                                  'Transfer request submitted successfully',
-                                  Colors.green,
-                                );
-                              } on DioException catch (e) {
-                                setModalState(
-                                  () => isSubmitting = false,
-                                );
-
-                                final msg =
-                                    e.response?.data[
-                                            'message'] ??
-                                        'Failed to submit request';
-
-                                _showToast(
-                                  msg,
-                                  Colors.red,
-                                );
-                              }
-                            },
-                  icon: isSubmitting
-                      ? const SizedBox(
-                          width: 18,
-                          height: 18,
-                          child:
-                              CircularProgressIndicator(
-                            strokeWidth: 2,
-                            color: Colors.white,
-                          ),
-                        )
-                      : const Icon(
-                          Icons.send,
-                          color: Colors.white,
-                        ),
-                  label: Text(
-                    isSubmitting
-                        ? 'Sending...'
-                        : 'Send Transfer Request',
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor:
-                        const Color(0xff1a2a6c),
-                    padding:
-                        const EdgeInsets.symmetric(
-                      vertical: 14,
-                    ),
-                    shape:
-                        RoundedRectangleBorder(
-                      borderRadius:
-                          BorderRadius.circular(12),
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  String _timeText(TimeOfDay? time) =>
-      time == null
-          ? ''
-          : '${time.hour.toString().padLeft(2, '0')}:${time.minute.toString().padLeft(2, '0')}';
-
-  String _attendanceTimeText(dynamic value) {
-    if (value == null || value.toString().isEmpty) {
-      return '--:--';
-    }
-
-    final match = RegExp(
-      r'(?:T| )(\d{2}:\d{2})',
-    ).firstMatch(
-      value.toString(),
-    );
-
-    return match?.group(1) ?? value.toString();
-  }
-
-  Future<TimeOfDay?> _pickLunchTime(
-    String title,
-    TimeOfDay? initial,
-  ) async {
-    return showTimePicker(
-      context: context,
-      initialTime: initial ?? TimeOfDay.now(),
-      helpText: title,
-    );
-  }
-
-  Future<void> _chooseDefaultLunchStart() async {
-    final value = await _pickLunchTime(
-      'Select Lunch Start',
-      _defaultLunchStart,
-    );
-
-    if (value != null && mounted) {
-      setState(
-        () => _defaultLunchStart = value,
-      );
-    }
-  }
-
-  Future<void> _chooseDefaultLunchEnd() async {
-    final value = await _pickLunchTime(
-      'Select Lunch End',
-      _defaultLunchEnd,
-    );
-
-    if (value != null && mounted) {
-      setState(
-        () => _defaultLunchEnd = value,
-      );
-    }
-  }
-
-  Future<void> _editWorkerLunch(
-    int workerId,
-  ) async {
-    final current = _lunchOverrides[workerId];
-
-    final start = await _pickLunchTime(
-      'Select Worker Lunch Start',
-      current?['start'] ?? _defaultLunchStart,
-    );
-
-    if (start == null || !mounted) return;
-
-    final end = await _pickLunchTime(
-      'Select Worker Lunch End',
-      current?['end'] ?? _defaultLunchEnd,
-    );
-
-    if (end == null || !mounted) return;
-
-    setState(() {
-      _lunchOverrides[workerId] = {
-        'start': start,
-        'end': end,
-      };
-    });
-  }
-
-
-Future<void> _saveLunchTimes() async {
-  final eligibleIds = _lunchEligibleWorkers
-      .map(
-        (w) => int.parse(
-          w['worker_id'].toString(),
-        ),
-      )
-      .toSet();
-
-  // تنظيف أي IDs قديمة ما عادت موجودة بالقائمة الحالية
-  _lunchExcludedWorkerIds.removeWhere(
-    (id) => !eligibleIds.contains(id),
-  );
-
-  _lunchOverrides.removeWhere(
-    (id, _) => !eligibleIds.contains(id),
-  );
-
-  final includedIds = eligibleIds.difference(
-    _lunchExcludedWorkerIds,
-  );
-
-  if (includedIds.isEmpty) {
-    _showToast(
-      'All workers are excluded — nothing to save.',
-      Colors.orange,
-    );
-    return;
-  }
-
-  // إذا ما في Default Lunch، لازم كل عامل مشمول يكون عنده Override.
-  final hasDefaultLunch =
-      _defaultLunchStart != null &&
-      _defaultLunchEnd != null;
-
-  if (!hasDefaultLunch) {
-    final missingOverrideIds = includedIds.where(
-      (id) {
-        final override = _lunchOverrides[id];
-
-        return override == null ||
-            override['start'] == null ||
-            override['end'] == null;
-      },
-    ).toSet();
-
-    if (missingOverrideIds.isNotEmpty) {
-      _showToast(
-        'Set a lunch time for all included workers or configure a default lunch period.',
-        Colors.orange,
-      );
-      return;
-    }
-  }
-
-  final overrides = <String, dynamic>{};
-
-  for (final entry in _lunchOverrides.entries) {
-    overrides[entry.key.toString()] = {
-      'start_time': _timeText(
-        entry.value['start'],
-      ),
-      'end_time': _timeText(
-        entry.value['end'],
-      ),
-    };
-  }
-
-  setState(() => _isLoading = true);
-
-  try {
-final response = await ApiConfig.dio.post(
-  '/attendance/lunch/bulk',
-  data: {
-    'siteId': widget.siteId,
-    'shift_type': widget.shiftType, // ← جديد
-    'date': _recordDate,
-    'default_start_time': hasDefaultLunch ? _timeText(_defaultLunchStart) : null,
-    'default_end_time': hasDefaultLunch ? _timeText(_defaultLunchEnd) : null,
-    'overrides': overrides,
-    'excluded_worker_ids': _lunchExcludedWorkerIds.toList(),
-  },
-);
-
-    await _fetchWorkers();
-
-    if (mounted &&
-        response.data['status'] == 'success') {
-      final saved =
-          response.data['updated_records'] ??
-              includedIds.length;
-
-      _showToast(
-        'Lunch times saved for $saved worker(s).',
-        Colors.green,
-      );
-    }
-  } on DioException catch (e) {
-    if (!mounted) return;
-
-    setState(() => _isLoading = false);
-
-    final data = e.response?.data;
-
-    _showToast(
-      data is Map && data['message'] != null
-          ? data['message'].toString()
-          : 'Failed to save lunch times.',
-      Colors.red,
-    );
-  }
-}
-  Future<void> _showMissingAttendanceDialog(
-    List<Map<String, dynamic>> missingWorkers,
-  ) async {
-    if (!mounted) return;
-
-    await showDialog<void>(
-      context: context,
-      builder: (context) => AlertDialog(
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(16),
-        ),
-        title: const Text('Attendance is incomplete'),
-        content: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                'Record Present, Absent, Sick, Vacation, or Holiday for every assigned worker before submitting this day.',
-              ),
-              const SizedBox(height: 12),
-              ...missingWorkers.map(
-                (worker) => Padding(
-                  padding: const EdgeInsets.only(bottom: 6),
-                  child: Text(
-                    '• ${worker['full_name'] ?? 'Unknown worker'}',
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Close'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Future<void> _submitDay() async {
-    final missingWorkers = _workers
-        .where((worker) => worker['attendance_id'] == null)
-        .map<Map<String, dynamic>>(
-          (worker) => Map<String, dynamic>.from(worker),
-        )
-        .toList();
-
-    if (missingWorkers.isNotEmpty) {
-      await _showMissingAttendanceDialog(missingWorkers);
-      return;
-    }
-
-    bool hasActiveCheckIns = _workers.any(
-      (w) => w['attendance_id'] != null,
-    );
-
-    if (!hasActiveCheckIns) {
-      _showToast(
-        'No active attendance records to submit.',
-        Colors.orange,
-      );
-      return;
-    }
-
-    bool? confirm = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(16),
-        ),
-        title: const Text(
-          'Confirm Submission',
-        ),
-        content: const Text(
-          'Are you sure you want to end the day and submit records for review? Make sure all workers have checked out.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () =>
-                Navigator.pop(context, false),
-            child: const Text('Cancel'),
-          ),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(
-              backgroundColor:
-                  const Color(0xff1a2a6c),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(8),
-              ),
-            ),
-            onPressed: () =>
-                Navigator.pop(context, true),
-            child: const Text(
-              'Submit',
-              style: TextStyle(
-                color: Colors.white,
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-
-    if (confirm != true) return;
-
-    await _performSubmit();
-  }
-
-  Future<void> _performSubmit({
-    List<Map<String, dynamic>>?
-        confirmedLunchSkips,
-  }) async {
-    setState(() => _isLoading = true);
-
-    try {
-final response = await ApiConfig.dio.post(
-  '/attendance/submit',
-  data: {
-    'siteId': widget.siteId,
-    'shift_type': widget.shiftType, // ← جديد
-    'record_date': _recordDate,
-    if (confirmedLunchSkips != null && confirmedLunchSkips.isNotEmpty)
-      'confirmed_lunch_skips': confirmedLunchSkips,
-  },
-);
-
-      final data = response.data is Map
-          ? response.data as Map
-          : <String, dynamic>{};
-
-      if (data['status'] == 'warning' &&
-          data['requires_confirmation'] == true) {
-        setState(() => _isLoading = false);
-
-        final missingWorkers =
-            (data['missing_workers'] as List)
-                .cast<Map<String, dynamic>>();
-
-        final reasonControllers = {
-          for (var w in missingWorkers)
-            w['attendance_id']:
-                TextEditingController(),
-        };
-
-        final proceed =
-            await showDialog<bool>(
-          context: context,
-          builder: (context) => AlertDialog(
-            shape: RoundedRectangleBorder(
-              borderRadius:
-                  BorderRadius.circular(16),
-            ),
-            title: const Text(
-              'Missing Lunch Time',
-            ),
-            content: SingleChildScrollView(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment:
-                    CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    'These workers have no recorded lunch break. Please provide a reason for each to continue.',
-                    style: TextStyle(
-                      fontSize: 13,
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  ...missingWorkers.map((w) {
-                    return Padding(
-                      padding:
-                          const EdgeInsets.only(
-                        bottom: 12,
-                      ),
-                      child: TextField(
-                        controller:
-                            reasonControllers[
-                                w['attendance_id']],
-                        decoration:
-                            InputDecoration(
-                          labelText:
-                              '${w['full_name']} — reason',
-                          border:
-                              const OutlineInputBorder(),
-                        ),
-                      ),
-                    );
+                DropdownButtonFormField<Map>(
+                  value: target,
+                  isExpanded: true,
+                  decoration: const InputDecoration(labelText: 'Target site', border: OutlineInputBorder()),
+                  items: sites
+                      .whereType<Map>()
+                      .map((s) => DropdownMenuItem<Map>(value: s, child: Text(s['site_name'].toString())))
+                      .toList(),
+                  onChanged: (v) => setS(() {
+                    target = v;
+                    final shifts = v != null && (v['supports_shifts'] == 1 || v['supports_shifts'] == true);
+                    if (!shifts) targetShift = 'Day';
                   }),
+                ),
+                if (supportsShifts) ...[
+                  const SizedBox(height: 12),
+                  SegmentedButton<String>(
+                    segments: const [
+                      ButtonSegment(value: 'Day', label: Text('Day shift'), icon: Icon(Icons.wb_sunny_rounded)),
+                      ButtonSegment(value: 'Night', label: Text('Night shift'), icon: Icon(Icons.nights_stay_rounded)),
+                    ],
+                    selected: {targetShift},
+                    onSelectionChanged: (s) => setS(() => targetShift = s.first),
+                  ),
                 ],
-              ),
+                const SizedBox(height: 12),
+                ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: const Icon(Icons.event_rounded),
+                  title: const Text('First day at the new site'),
+                  subtitle: Text('${DateFormat('EEE d MMM yyyy').format(effective)} — the last day here is the day before'),
+                  trailing: const Icon(Icons.edit_calendar_rounded),
+                  onTap: () async {
+                    final d = await showDatePicker(
+                        context: sheet, initialDate: effective, firstDate: DateTime(2024), lastDate: DateTime(2100));
+                    if (d != null) setS(() => effective = d);
+                  },
+                ),
+                TextField(
+                  controller: reason,
+                  maxLines: 2,
+                  decoration: const InputDecoration(labelText: 'Reason (required)', border: OutlineInputBorder()),
+                ),
+                if (sameAsCurrent)
+                  const Padding(
+                    padding: EdgeInsets.only(top: 8),
+                    child: Text('The target is the current site and shift.', style: TextStyle(color: Colors.red)),
+                  ),
+                const SizedBox(height: 16),
+                ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                      backgroundColor: _primary, foregroundColor: Colors.white, padding: const EdgeInsets.symmetric(vertical: 14)),
+                  onPressed: (target == null || sameAsCurrent || sending)
+                      ? null
+                      : () async {
+                          if (reason.text.trim().length < 3) {
+                            _toast('Please enter a reason.', color: Colors.orange.shade800);
+                            return;
+                          }
+                          setS(() => sending = true);
+                          try {
+                            await ApiConfig.dio.post('/transfers', data: {
+                              'worker_id': _id(w),
+                              'current_site_id': widget.siteId,
+                              'current_shift_type': widget.shiftType,
+                              'target_site_id': target!['site_id'],
+                              'target_shift_type': targetShift,
+                              'effective_date': DateFormat('yyyy-MM-dd').format(effective),
+                              'transfer_reason': reason.text.trim(),
+                            });
+                            if (sheet.mounted) Navigator.pop(sheet);
+                            _toast('Transfer request sent to the Admin.');
+                          } on DioException catch (e) {
+                            setS(() => sending = false);
+                            _toast(_msg(e, 'Failed to send the request.'), color: Colors.red.shade700);
+                          }
+                        },
+                  icon: const Icon(Icons.send_rounded),
+                  label: Text(sending ? 'Sending...' : 'Send transfer request'),
+                ),
+              ]),
             ),
-            actions: [
-              TextButton(
-                onPressed: () =>
-                    Navigator.pop(
-                  context,
-                  false,
-                ),
-                child:
-                    const Text('Cancel'),
-              ),
-              ElevatedButton(
-                style:
-                    ElevatedButton.styleFrom(
-                  backgroundColor:
-                      Colors.orange.shade800,
-                ),
-                onPressed: () =>
-                    Navigator.pop(
-                  context,
-                  true,
-                ),
-                child: const Text(
-                  'Confirm & Submit',
-                  style: TextStyle(
-                    color: Colors.white,
-                  ),
-                ),
-              ),
-            ],
-          ),
-        );
-
-        if (proceed == true) {
-          final skips =
-              reasonControllers.entries
-                  .where(
-                    (e) => e.value.text
-                        .trim()
-                        .isNotEmpty,
-                  )
-                  .map(
-                    (e) => {
-                      'attendance_id':
-                          e.key,
-                      'reason':
-                          e.value.text.trim(),
-                    },
-                  )
-                  .toList();
-
-          if (skips.length <
-              missingWorkers.length) {
-            if (mounted) {
-              _showToast(
-                'Please provide a reason for every listed worker.',
-                Colors.orange,
-              );
-            }
-
-            return;
-          }
-
-          await _performSubmit(
-            confirmedLunchSkips: skips,
           );
-        }
-
-        return;
-      }
-
-      if (data['status'] == 'success') {
-        await _fetchWorkers();
-
-        if (!mounted) return;
-
-        _showToast(
-          'Day submitted successfully',
-          Colors.green,
-        );
-
-        if (_workers.isEmpty) {
-          Navigator.pop(context);
-        }
-      } else {
-        setState(() => _isLoading = false);
-      }
-    } on DioException catch (e) {
-      setState(() => _isLoading = false);
-
-      final responseData = e.response?.data;
-      if (responseData is Map &&
-          responseData['code'] == 'MISSING_ATTENDANCE_RECORDS') {
-        final missingWorkers = (responseData['missing_workers'] as List? ?? [])
-            .whereType<Map>()
-            .map<Map<String, dynamic>>(
-              (worker) => Map<String, dynamic>.from(worker),
-            )
-            .toList();
-
-        if (missingWorkers.isNotEmpty) {
-          await _showMissingAttendanceDialog(missingWorkers);
-        } else {
-          _showToast(
-            responseData['message']?.toString() ?? 'Attendance is incomplete.',
-            Colors.orange,
-          );
-        }
-        return;
-      }
-
-      final msg = responseData is Map
-          ? (responseData['message'] ??
-              'Final submission failed. Ensure all workers have checked out.')
-          : 'Final submission failed.';
-
-      _showToast(
-        msg,
-        Colors.red,
-      );
-    } catch (e) {
-      setState(() => _isLoading = false);
-
-      _showToast(
-        'Server connection error',
-        Colors.red,
-      );
-    }
-  }
-
-  // -------------------------------------------------------------------
-  // BULK ATTENDANCE UI
-  // -------------------------------------------------------------------
-  Widget _buildBulkAttendanceCard() {
-    final eligibleCheckInIds = _workers
-        .where((worker) {
-          final id = int.tryParse(
-            worker['worker_id'].toString(),
-          );
-
-          return id != null &&
-              _canBulkCheckIn(worker) &&
-              worker['check_in_time'] == null;
-        })
-        .map<int>(
-          (worker) => int.parse(
-            worker['worker_id'].toString(),
-          ),
-        )
-        .toSet();
-
-    final eligibleCheckOutIds = _workers
-        .where((worker) {
-          final id = int.tryParse(
-            worker['worker_id'].toString(),
-          );
-
-          return id != null &&
-              _canBulkCheckOut(worker);
-        })
-        .map<int>(
-          (worker) => int.parse(
-            worker['worker_id'].toString(),
-          ),
-        )
-        .toSet();
-
-    final selectedCheckInCount =
-        _eligibleSelectedWorkerIds(true).length;
-final selectedAbsentCount = _eligibleSelectedWorkerIdsForAbsent().length;
-
-    final selectedCheckOutCount =
-        _eligibleSelectedWorkerIds(false).length;
-
-    final canSelectEligible =
-        eligibleCheckInIds.isNotEmpty ||
-        eligibleCheckOutIds.isNotEmpty;
-
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(
-        16,
-        0,
-        16,
-        12,
-      ),
-      child: Card(
-        elevation: 0,
-        margin: EdgeInsets.zero,
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(14),
-          side: BorderSide(
-            color: Colors.grey.shade200,
-          ),
-        ),
-        child: Padding(
-          padding: const EdgeInsets.all(14),
-          child: Column(
-            crossAxisAlignment:
-                CrossAxisAlignment.start,
-            children: [
-              // Header
-              Row(
-                children: [
-                  Container(
-                    padding: const EdgeInsets.all(9),
-                    decoration: BoxDecoration(
-                      color: const Color(
-                        0xff1a2a6c,
-                      ).withOpacity(0.08),
-                      borderRadius:
-                          BorderRadius.circular(10),
-                    ),
-                    child: const Icon(
-                      Icons.groups_rounded,
-                      color: Color(0xff1a2a6c),
-                      size: 21,
-                    ),
-                  ),
-                  const SizedBox(width: 10),
-                  const Expanded(
-                    child: Column(
-                      crossAxisAlignment:
-                          CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          'Bulk Attendance',
-                          style: TextStyle(
-                            fontWeight:
-                                FontWeight.bold,
-                            fontSize: 15,
-                            color:
-                                Color(0xff1a2a6c),
-                          ),
-                        ),
-                        SizedBox(height: 2),
-                        Text(
-                          'Select workers from the table and apply attendance actions in bulk.',
-                          style: TextStyle(
-                            fontSize: 11.5,
-                            color: Colors.grey,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  if (_selectedWorkerIds.isNotEmpty)
-                    Container(
-                      padding:
-                          const EdgeInsets.symmetric(
-                        horizontal: 9,
-                        vertical: 5,
-                      ),
-                      decoration: BoxDecoration(
-                        color: const Color(
-                          0xff1a2a6c,
-                        ).withOpacity(0.08),
-                        borderRadius:
-                            BorderRadius.circular(
-                          20,
-                        ),
-                      ),
-                      child: Text(
-                        '${_selectedWorkerIds.length} selected',
-                        style: const TextStyle(
-                          fontSize: 11,
-                          fontWeight:
-                              FontWeight.w700,
-                          color:
-                              Color(0xff1a2a6c),
-                        ),
-                      ),
-                    ),
-                ],
-              ),
-
-              const SizedBox(height: 12),
-
-              // Selection controls
-              Row(
-                children: [
-                  Expanded(
-                    child: OutlinedButton.icon(
-                      onPressed:
-                          !canSelectEligible
-                              ? null
-                              : () {
-                                  setState(() {
-                                    _selectedWorkerIds
-                                        .addAll(
-                                      eligibleCheckInIds,
-                                    );
-
-                                    _selectedWorkerIds
-                                        .addAll(
-                                      eligibleCheckOutIds,
-                                    );
-                                  });
-                                },
-                      icon: const Icon(
-                        Icons.done_all_rounded,
-                        size: 17,
-                      ),
-                      label: const Text(
-                        'Select Eligible',
-                      ),
-                      style:
-                          OutlinedButton.styleFrom(
-                        padding:
-                            const EdgeInsets
-                                .symmetric(
-                          vertical: 10,
-                        ),
-                        shape:
-                            RoundedRectangleBorder(
-                          borderRadius:
-                              BorderRadius
-                                  .circular(9),
-                        ),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: OutlinedButton.icon(
-                      onPressed:
-                          _selectedWorkerIds.isEmpty
-                              ? null
-                              : () {
-                                  setState(() {
-                                    _selectedWorkerIds
-                                        .clear();
-                                  });
-                                },
-                      icon: const Icon(
-                        Icons.clear_all_rounded,
-                        size: 17,
-                      ),
-                      label: const Text(
-                        'Clear Selection',
-                      ),
-                      style:
-                          OutlinedButton.styleFrom(
-                        padding:
-                            const EdgeInsets
-                                .symmetric(
-                          vertical: 10,
-                        ),
-                        shape:
-                            RoundedRectangleBorder(
-                          borderRadius:
-                              BorderRadius
-                                  .circular(9),
-                        ),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-
-              const SizedBox(height: 10),
-
-              // Bulk actions
-              Row(
-                children: [
-                  Expanded(
-                    child: ElevatedButton.icon(
-                      onPressed:
-                          selectedCheckInCount ==
-                                  0
-                              ? null
-                              : () =>
-                                  _bulkAttendanceAction(
-                                    checkIn: true,
-                                  ),
-                      icon: const Icon(
-                        Icons.login_rounded,
-                        size: 18,
-                      ),
-                      label: Text(
-                        selectedCheckInCount ==
-                                0
-                            ? 'Bulk Check-In'
-                            : 'Check-In ($selectedCheckInCount)',
-                      ),
-                      style:
-                          ElevatedButton.styleFrom(
-                        backgroundColor:
-                            Colors.green.shade700,
-                        foregroundColor:
-                            Colors.white,
-                        disabledBackgroundColor:
-                            Colors.grey.shade200,
-                        disabledForegroundColor:
-                            Colors.grey.shade500,
-                        padding:
-                            const EdgeInsets
-                                .symmetric(
-                          vertical: 12,
-                        ),
-                        elevation: 0,
-                        shape:
-                            RoundedRectangleBorder(
-                          borderRadius:
-                              BorderRadius
-                                  .circular(10),
-                        ),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: ElevatedButton.icon(
-                      onPressed:
-                          selectedCheckOutCount ==
-                                  0
-                              ? null
-                              : () =>
-                                  _bulkAttendanceAction(
-                                    checkIn: false,
-                                  ),
-                      icon: const Icon(
-                        Icons.logout_rounded,
-                        size: 18,
-                      ),
-                      label: Text(
-                        selectedCheckOutCount ==
-                                0
-                            ? 'Bulk Check-Out'
-                            : 'Check-Out ($selectedCheckOutCount)',
-                      ),
-                      style:
-                          ElevatedButton.styleFrom(
-                        backgroundColor:
-                            const Color(
-                          0xff1a2a6c,
-                        ),
-                        foregroundColor:
-                            Colors.white,
-                        disabledBackgroundColor:
-                            Colors.grey.shade200,
-                        disabledForegroundColor:
-                            Colors.grey.shade500,
-                        padding:
-                            const EdgeInsets
-                                .symmetric(
-                          vertical: 12,
-                        ),
-                        elevation: 0,
-                        shape:
-                            RoundedRectangleBorder(
-                          borderRadius:
-                              BorderRadius
-                                  .circular(10),
-                        ),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-const SizedBox(height: 8),
-SizedBox(
-  width: double.infinity,
-  child: OutlinedButton.icon(
-    onPressed: selectedAbsentCount == 0 ? null : _bulkMarkAbsent,
-    icon: const Icon(Icons.person_off_rounded, size: 18, color: Colors.red),
-    label: Text(
-      selectedAbsentCount == 0
-          ? 'Bulk Mark Absent'
-          : 'Mark Absent ($selectedAbsentCount)',
-      style: const TextStyle(color: Colors.red, fontWeight: FontWeight.bold),
-    ),
-    style: OutlinedButton.styleFrom(
-      side: const BorderSide(color: Colors.red),
-      padding: const EdgeInsets.symmetric(vertical: 12),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-    ),
-  ),
-),
-              if (_selectedWorkerIds.isNotEmpty) ...[
-                const SizedBox(height: 8),
-                Text(
-                  'Check-In applies only to selected workers without a check-in. '
-                  'Check-Out applies only to selected workers with an open shift.',
-                  style: TextStyle(
-                    fontSize: 11,
-                    color: Colors.grey.shade600,
-                  ),
-                ),
-              ],
-            ],
-          ),
-        ),
+        },
       ),
     );
   }
 
-  Widget _buildWorkersTable() {
-    if (_filteredWorkers.isEmpty) {
-      return SizedBox(
-        height: 240,
-        child: Center(
-          child: Column(
-            mainAxisAlignment:
-                MainAxisAlignment.center,
-            children: [
-              Icon(
-                Icons.assignment_turned_in,
-                size: 56,
-                color: Colors.grey.shade400,
-              ),
-              const SizedBox(height: 10),
-              Text(
-                _searchQuery.isEmpty
-                    ? 'All workers accounted for or none available!'
-                    : 'No workers match "$_searchQuery"',
-                textAlign: TextAlign.center,
-                style: const TextStyle(
-                  fontSize: 14,
-                  color: Colors.grey,
-                  fontWeight: FontWeight.w500,
-                ),
-              ),
-            ],
-          ),
-        ),
-      );
-    }
-
-    final rows =
-        _filteredWorkers.map<DataRow>((worker) {
-      final workerId = int.parse(
-        worker['worker_id'].toString(),
-      );
-
-      final hasCheckIn =
-          worker['check_in_time'] != null;
-
-      final hasCheckOut =
-          worker['check_out_time'] != null;
-
-      final workflowStatus =
-          worker['workflow_status']?.toString();
-
-      final attendanceStatus =
-          worker['attendance_status']?.toString();
-
-      final isSubmitted =
-          workflowStatus == 'Submitted';
-
-      final isDraft =
-          workflowStatus == null ||
-              workflowStatus == 'Draft';
-
-      final isRejected =
-          workflowStatus == 'Rejected';
-
-      final isOnBreak =
-          worker['current_leave_id'] != null;
-
-      final status = isRejected
-          ? 'Rejected'
-          : attendanceStatus == 'Absent'
-              ? 'Absent'
-              : attendanceStatus == 'Sick'
-                  ? 'Sick Leave'
-                  : attendanceStatus == 'Vacation'
-                      ? 'Annual Leave'
-                      : attendanceStatus ==
-                              'Holiday'
-                          ? 'Holiday'
-                          : isOnBreak
-                              ? 'On Break'
-                              : hasCheckOut
-                                  ? 'Checked Out'
-                                  : hasCheckIn
-                                      ? 'Checked In'
-                                      : 'Not Checked In';
-
-      final statusColor = isRejected
-          ? Colors.red
-          : status == 'Absent'
-              ? Colors.red
-              : status == 'Sick Leave'
-                  ? Colors.orange
-                  : status == 'Annual Leave'
-                      ? Colors.blue
-                      : status == 'Holiday'
-                          ? Colors.purple
-                          : status == 'On Break'
-                              ? Colors.orange
-                              : status ==
-                                      'Checked In'
-                                  ? Colors.green
-                                  : status ==
-                                          'Checked Out'
-                                      ? Colors.blue
-                                      : Colors.grey;
-
-      return DataRow(
-        cells: [
-          DataCell(
-            SizedBox(
-              width: 180,
-              child: Row(
-                children: [
-                  CircleAvatar(
-                    radius: 16,
-                    backgroundColor:
-                        const Color(0xff1a2a6c)
-                            .withOpacity(0.10),
-                    child: Text(
-                      (worker['full_name'] ?? 'W')
-                          .toString()
-                          .substring(0, 1)
-                          .toUpperCase(),
-                      style: const TextStyle(
-                        color: Color(0xff1a2a6c),
-                        fontWeight:
-                            FontWeight.bold,
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      worker['full_name']
-                              ?.toString() ??
-                          'Worker',
-                      maxLines: 1,
-                      overflow:
-                          TextOverflow.ellipsis,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-          DataCell(
-            Container(
-              padding:
-                  const EdgeInsets.symmetric(
-                horizontal: 8,
-                vertical: 5,
-              ),
-              decoration: BoxDecoration(
-                color: statusColor
-                    .withOpacity(0.10),
-                borderRadius:
-                    BorderRadius.circular(8),
-              ),
-              child: Text(
-                status,
-                style: TextStyle(
-                  fontSize: 11,
-                  fontWeight:
-                      FontWeight.w700,
-                  color: statusColor,
-                ),
-              ),
-            ),
-          ),
-          DataCell(
-            Text(
-              _attendanceTimeText(
-                worker['check_in_time'],
-              ),
-            ),
-          ),
-          DataCell(
-            Text(
-              _attendanceTimeText(
-                worker['check_out_time'],
-              ),
-            ),
-          ),
-          DataCell(
-            PopupMenuButton<String>(
-              tooltip: 'Worker actions',
-              icon: const Icon(
-                Icons.more_horiz,
-                color: Color(0xff1a2a6c),
-              ),
-              onSelected:
-                  (action) async {
-                switch (action) {
-                  case 'status':
-                    await _showAttendanceStatusDialog(
-                      workerId,
-                      currentStatus:
-                          attendanceStatus,
-                    );
-                    break;
-
-                  case 'checkin':
-                    await _performCheckIn(
-                      workerId,
-                    );
-                    break;
-
-                  case 'break':
-                    if (isOnBreak) {
-                      await _performEndLeave(
-                        workerId,
-                      );
-                    } else {
-                      await _startLeaveDialog(
-                        workerId,
-                      );
-                    }
-                    break;
-
-                  case 'checkout':
-                    await _performCheckOut(
-                      workerId,
-                    );
-                    break;
-
-                  case 'lunch':
-                    await _editWorkerLunch(
-                      workerId,
-                    );
-                    break;
-
-                  case 'transfer':
-                    await _openTransferSheet(
-                      worker,
-                    );
-                    break;
-
-                  case 'edit_times':
-                    await _editTimesDialog(
-                      worker,
-                    );
-                    break;
-                }
-              },
-              itemBuilder: (_) => [
-                PopupMenuItem(
-                  value: 'status',
-                  // The backend can safely clear a mistaken clock-in when
-                  // correcting a Draft record to Absent/Sick/etc.
-                  enabled: isDraft,
-                  child: Text(
-                    attendanceStatus == null
-                        ? 'Set status'
-                        : 'Edit status',
-                  ),
-                ),
-                PopupMenuItem(
-                  value: 'checkin',
-                  enabled:
-                      !hasCheckIn &&
-                          !isRejected &&
-                          isDraft,
-                  child: const Text(
-                    'Check In',
-                  ),
-                ),
-                PopupMenuItem(
-                  value: 'break',
-                  enabled:
-                      hasCheckIn &&
-                          !hasCheckOut &&
-                          !isSubmitted &&
-                          !isRejected,
-                  child: Text(
-                    isOnBreak
-                        ? 'End Break'
-                        : 'Start Break',
-                  ),
-                ),
-                PopupMenuItem(
-                  value: 'checkout',
-                  enabled:
-                      hasCheckIn &&
-                          !hasCheckOut &&
-                          !isSubmitted &&
-                          !isRejected,
-                  child: const Text(
-                    'Check Out',
-                  ),
-                ),
-                const PopupMenuDivider(),
-                PopupMenuItem(
-                  value: 'edit_times',
-                  enabled: hasCheckIn,
-                  child: const Text(
-                    'Edit Check-in / Check-out',
-                  ),
-                ),
-                const PopupMenuItem(
-                  value: 'lunch',
-                  child: Text(
-                    'Edit Lunch',
-                  ),
-                ),
-                const PopupMenuItem(
-                  value: 'transfer',
-                  child: Text(
-                    'Transfer Worker',
-                  ),
-                ),
-              ],
-            ),
-          ),
-          DataCell(
-            Checkbox(
-              value: _selectedWorkerIds
-                  .contains(workerId),
-              onChanged: (checked) =>
-                  setState(() {
-                if (checked == true) {
-                  _selectedWorkerIds
-                      .add(workerId);
-                } else {
-                  _selectedWorkerIds
-                      .remove(workerId);
-                }
-              }),
-            ),
-          ),
-        ],
-      );
-    }).toList();
-
-    return Padding(
-      padding:
-          const EdgeInsets.fromLTRB(
-        12,
-        0,
-        12,
-        12,
-      ),
-      child: AppDataTableCard(
-        title: 'Workers Attendance',
-        subtitle:
-            '${_filteredWorkers.length} workers',
-        icon: Icons.groups_rounded,
-        accentColor:
-            const Color(0xff1a2a6c),
-        padding:
-            const EdgeInsets.all(12),
-        columns: const [
-          DataColumn(
-            label: Text('Worker'),
-          ),
-          DataColumn(
-            label: Text('Status'),
-          ),
-          DataColumn(
-            label: Text('Check In'),
-          ),
-          DataColumn(
-            label: Text('Check Out'),
-          ),
-          DataColumn(
-            label: Text('Actions'),
-          ),
-          DataColumn(
-            label: Text('Select'),
-          ),
-        ],
-        rows: rows,
-      ),
-    );
-  }
+  // ------------------------------------------------------------- UI
 
   @override
   Widget build(BuildContext context) {
-    final formattedDate =
-        DateFormat('yyyy/MM/dd').format(
-      DateTime.parse(_recordDate),
-    );
-
     return Scaffold(
-      backgroundColor:
-          const Color(0xfff8f9fa),
+      backgroundColor: const Color(0xfff5f6fa),
       appBar: AppBar(
-        backgroundColor:
-            const Color(0xff1a2a6c),
+        backgroundColor: _primary,
+        foregroundColor: Colors.white,
         elevation: 0,
-     title: Column(
-  crossAxisAlignment: CrossAxisAlignment.start,
-  children: [
-    Text(widget.siteName, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white)),
-    Text('Daily Attendance — ${widget.shiftType} Shift', style: const TextStyle(fontSize: 11, color: Colors.white70)),
-  ],
-),
-        iconTheme: const IconThemeData(
-          color: Colors.white,
-        ),
+        title: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(widget.siteName, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+          Text('${widget.shiftType} shift — daily attendance', style: const TextStyle(fontSize: 11, color: Colors.white70)),
+        ]),
         actions: [
           IconButton(
-            icon: const Icon(
-              Icons.warning_amber_rounded,
-              color: Colors.amberAccent,
-            ),
-            tooltip: 'Rejected Records',
-            onPressed: () =>
-                Navigator.push(
-              context,
-              MaterialPageRoute(
-                builder: (_) =>
-                    const RejectedRecordsScreen(),
-              ),
-            ),
+            tooltip: 'How this page works',
+            icon: const Icon(Icons.help_outline_rounded),
+            onPressed: () => HelpTip.show(context, 'Daily attendance',
+                '${HelpTexts.workflow}\n\n${HelpTexts.futureDates}\n\n${HelpTexts.previousWeek}'),
           ),
+          IconButton(
+            tooltip: 'Rejected records',
+            icon: const Icon(Icons.assignment_late_rounded, color: Colors.amberAccent),
+            onPressed: () async {
+              await Navigator.push(context, MaterialPageRoute(builder: (_) => const RejectedRecordsScreen()));
+              _load();
+            },
+          ),
+          IconButton(tooltip: 'Refresh', icon: const Icon(Icons.refresh_rounded), onPressed: _busy ? null : () => _load()),
         ],
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(3),
+          child: _busy
+              ? const LinearProgressIndicator(minHeight: 3, color: Colors.amberAccent, backgroundColor: Colors.transparent)
+              : const SizedBox(height: 3),
+        ),
       ),
-      body: _isLoading
-          ? const Center(
-              child:
-                  CircularProgressIndicator(
-                color: Color(0xff1a2a6c),
-              ),
-            )
-          : Column(
-              children: [
-                Expanded(
+      body: _initialLoading
+          ? const Center(child: CircularProgressIndicator(color: _primary))
+          : _loadError != null && _workers.isEmpty
+              ? _errorState()
+              : RefreshIndicator(
+                  onRefresh: () => _load(),
                   child: ListView(
-                    padding:
-                        const EdgeInsets.only(
-                      bottom: 12,
-                    ),
+                    padding: const EdgeInsets.fromLTRB(12, 12, 12, 24),
                     children: [
-                      Padding(
-                        padding:
-                            const EdgeInsets.all(
-                          16.0,
-                        ),
-                        child: Container(
-                          decoration:
-                              BoxDecoration(
-                            color: Colors.white,
-                            borderRadius:
-                                BorderRadius.circular(
-                              16,
-                            ),
-                            boxShadow: [
-                              BoxShadow(
-                                color: Colors.black
-                                    .withOpacity(
-                                  0.04,
-                                ),
-                                blurRadius: 10,
-                                offset:
-                                    const Offset(
-                                  0,
-                                  4,
-                                ),
-                              ),
-                            ],
-                          ),
-                          child: Padding(
-                            padding:
-                                const EdgeInsets.all(
-                              16.0,
-                            ),
-                            child: Row(
-                              children: [
-                                Container(
-                                  padding:
-                                      const EdgeInsets
-                                          .all(
-                                    12,
-                                  ),
-                                  decoration:
-                                      BoxDecoration(
-                                    color: const Color(
-                                      0xff1a2a6c,
-                                    ).withOpacity(
-                                      0.1,
-                                    ),
-                                    borderRadius:
-                                        BorderRadius
-                                            .circular(
-                                      12,
-                                    ),
-                                  ),
-                                  child: const Icon(
-                                    Icons
-                                        .today_rounded,
-                                    color: Color(
-                                      0xff1a2a6c,
-                                    ),
-                                    size: 24,
-                                  ),
-                                ),
-                                const SizedBox(
-                                  width: 14,
-                                ),
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment
-                                            .start,
-                                    children: [
-                                      Row(
-                                        children: [
-                                          Text(
-                                            DateFormat(
-                                              'yyyy/MM/dd',
-                                            ).format(
-                                              DateTime
-                                                  .parse(
-                                                _recordDate,
-                                              ),
-                                            ),
-                                            style:
-                                                const TextStyle(
-                                              fontSize:
-                                                  16,
-                                              fontWeight:
-                                                  FontWeight
-                                                      .bold,
-                                              color: Color(
-                                                0xff1a2a6c,
-                                              ),
-                                            ),
-                                          ),
-                                          const SizedBox(
-                                            width: 8,
-                                          ),
-                                          InkWell(
-                                            onTap:
-                                                _chooseAttendanceDate,
-                                            borderRadius:
-                                                BorderRadius
-                                                    .circular(
-                                              6,
-                                            ),
-                                            child:
-                                                Container(
-                                              padding:
-                                                  const EdgeInsets
-                                                      .symmetric(
-                                                horizontal:
-                                                    8,
-                                                vertical:
-                                                    2,
-                                              ),
-                                              decoration:
-                                                  BoxDecoration(
-                                                color: Colors
-                                                    .green
-                                                    .shade50,
-                                                borderRadius:
-                                                    BorderRadius
-                                                        .circular(
-                                                  6,
-                                                ),
-                                                border:
-                                                    Border.all(
-                                                  color: Colors
-                                                      .green
-                                                      .shade200,
-                                                ),
-                                              ),
-                                              child: Row(
-                                                mainAxisSize:
-                                                    MainAxisSize
-                                                        .min,
-                                                children:
-                                                    const [
-                                                  Text(
-                                                    'Selected',
-                                                    style:
-                                                        TextStyle(
-                                                      fontSize:
-                                                          10,
-                                                      fontWeight:
-                                                          FontWeight
-                                                              .bold,
-                                                      color:
-                                                          Colors.green,
-                                                    ),
-                                                  ),
-                                                  SizedBox(
-                                                    width:
-                                                        4,
-                                                  ),
-                                                  Icon(
-                                                    Icons
-                                                        .edit_calendar,
-                                                    size:
-                                                        13,
-                                                    color:
-                                                        Colors.green,
-                                                  ),
-                                                ],
-                                              ),
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                                      const SizedBox(
-                                        height: 2,
-                                      ),
-                                      Text(
-                                        'Tap the date to change the manual shift date',
-                                        style: TextStyle(
-                                          fontSize: 12,
-                                          color: Colors
-                                              .grey
-                                              .shade600,
-                                          fontWeight:
-                                              FontWeight
-                                                  .w500,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                      ),
-
-                      Padding(
-                        padding:
-                            const EdgeInsets.fromLTRB(
-                          16,
-                          0,
-                          16,
-                          12,
-                        ),
-                        child: TextField(
-                          controller:
-                              _searchController,
-                          onChanged: (value) =>
-                              setState(
-                            () => _searchQuery =
-                                value,
-                          ),
-                          decoration:
-                              InputDecoration(
-                            hintText:
-                                'Search worker by name...',
-                            prefixIcon:
-                                const Icon(
-                              Icons.search,
-                            ),
-                            filled: true,
-                            fillColor:
-                                Colors.white,
-                            suffixIcon:
-                                _searchQuery.isEmpty
-                                    ? null
-                                    : IconButton(
-                                        icon:
-                                            const Icon(
-                                          Icons.clear,
-                                        ),
-                                        onPressed:
-                                            () {
-                                          _searchController
-                                              .clear();
-
-                                          setState(
-                                            () =>
-                                                _searchQuery =
-                                                    '',
-                                          );
-                                        },
-                                      ),
-                            contentPadding:
-                                const EdgeInsets
-                                    .symmetric(
-                              vertical: 0,
-                              horizontal: 16,
-                            ),
-                            border:
-                                OutlineInputBorder(
-                              borderRadius:
-                                  BorderRadius.circular(
-                                14,
-                              ),
-                              borderSide:
-                                  BorderSide.none,
-                            ),
-                          ),
-                        ),
-                      ),
-
-                      // ==================================================
-                      // BULK ATTENDANCE
-                      // ==================================================
-                      _buildBulkAttendanceCard(),
-
-                      // ==================================================
-                      // LUNCH BREAK — BULK ENTRY
-                      // ==================================================
-                      Padding(
-                        padding:
-                            const EdgeInsets.fromLTRB(
-                          16,
-                          0,
-                          16,
-                          12,
-                        ),
-                        child: Card(
-                          elevation: 0,
-                          child: Padding(
-                            padding:
-                                const EdgeInsets.all(
-                              14,
-                            ),
-                            child: Column(
-                              crossAxisAlignment:
-                                  CrossAxisAlignment
-                                      .start,
-                              children: [
-                                Row(
-                                  children: [
-                                    const Icon(
-                                      Icons
-                                          .lunch_dining,
-                                      color: Color(
-                                        0xff1a2a6c,
-                                      ),
-                                    ),
-                                    const SizedBox(
-                                      width: 8,
-                                    ),
-                                    const Text(
-                                      'Lunch Break — Bulk Entry',
-                                      style:
-                                          TextStyle(
-                                        fontWeight:
-                                            FontWeight
-                                                .bold,
-                                        fontSize: 15,
-                                        color: Color(
-                                          0xff1a2a6c,
-                                        ),
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                                const SizedBox(
-                                  height: 4,
-                                ),
-                                Text(
-                                  'All workers are checked by default. Uncheck anyone who had a different lunch time or did not take a break.',
-                                  style: TextStyle(
-                                    fontSize: 12,
-                                    color: Colors
-                                        .grey
-                                        .shade600,
-                                  ),
-                                ),
-                                const SizedBox(
-                                  height: 12,
-                                ),
-                                Row(
-                                  children: [
-                                    Expanded(
-                                      child:
-                                          OutlinedButton
-                                              .icon(
-                                        onPressed:
-                                            _chooseDefaultLunchStart,
-                                        icon:
-                                            const Icon(
-                                          Icons
-                                              .login_rounded,
-                                          size: 16,
-                                        ),
-                                        label: Text(
-                                          'Start: ${_timeText(_defaultLunchStart).isEmpty ? '--:--' : _timeText(_defaultLunchStart)}',
-                                        ),
-                                      ),
-                                    ),
-                                    const SizedBox(
-                                      width: 8,
-                                    ),
-                                    Expanded(
-                                      child:
-                                          OutlinedButton
-                                              .icon(
-                                        onPressed:
-                                            _chooseDefaultLunchEnd,
-                                        icon:
-                                            const Icon(
-                                          Icons
-                                              .logout_rounded,
-                                          size: 16,
-                                        ),
-                                        label: Text(
-                                          'End: ${_timeText(_defaultLunchEnd).isEmpty ? '--:--' : _timeText(_defaultLunchEnd)}',
-                                        ),
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                                const SizedBox(
-                                  height: 14,
-                                ),
-                                if (_lunchEligibleWorkers
-                                    .isEmpty)
-                                  Padding(
-                                    padding:
-                                        const EdgeInsets
-                                            .symmetric(
-                                      vertical: 12,
-                                    ),
-                                    child: Text(
-                                      'No workers with a completed shift (check-in & check-out) yet today.',
-                                      style: TextStyle(
-                                        color: Colors
-                                            .grey
-                                            .shade600,
-                                        fontSize:
-                                            12.5,
-                                      ),
-                                    ),
-                                  )
-                                else ...[
-                                  Row(
-                                    children: [
-                                      Expanded(
-                                        child:
-                                            Text(
-                                          'Workers (${_lunchEligibleWorkers.length - _lunchExcludedWorkerIds.length}/${_lunchEligibleWorkers.length} included)',
-                                          style:
-                                              const TextStyle(
-                                            fontWeight:
-                                                FontWeight
-                                                    .w600,
-                                            fontSize:
-                                                13,
-                                          ),
-                                        ),
-                                      ),
-                                      TextButton(
-                                        onPressed:
-                                            () =>
-                                                setState(
-                                          () {
-                                            if (_lunchExcludedWorkerIds
-                                                .isEmpty) {
-                                              _lunchExcludedWorkerIds
-                                                  .addAll(
-                                                _lunchEligibleWorkers
-                                                    .map(
-                                                  (w) => int
-                                                      .parse(
-                                                    w['worker_id']
-                                                        .toString(),
-                                                  ),
-                                                ),
-                                              );
-                                            } else {
-                                              _lunchExcludedWorkerIds
-                                                  .clear();
-                                            }
-                                          },
-                                        ),
-                                        child: Text(
-                                          _lunchExcludedWorkerIds
-                                                  .isEmpty
-                                              ? 'Uncheck all'
-                                              : 'Check all',
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                  Container(
-                                    constraints:
-                                        const BoxConstraints(
-                                      maxHeight: 280,
-                                    ),
-                                    decoration:
-                                        BoxDecoration(
-                                      border:
-                                          Border.all(
-                                        color: Colors
-                                            .grey
-                                            .shade200,
-                                      ),
-                                      borderRadius:
-                                          BorderRadius
-                                              .circular(
-                                        10,
-                                      ),
-                                    ),
-                                    child: ListView
-                                        .separated(
-                                      shrinkWrap:
-                                          true,
-                                      itemCount:
-                                          _lunchEligibleWorkers
-                                              .length,
-                                      separatorBuilder:
-                                          (_, __) =>
-                                              Divider(
-                                        height: 1,
-                                        color: Colors
-                                            .grey
-                                            .shade100,
-                                      ),
-                                      itemBuilder:
-                                          (
-                                        context,
-                                        index,
-                                      ) {
-                                        final worker =
-                                            _lunchEligibleWorkers[
-                                                index];
-
-                                        final workerId =
-                                            int.parse(
-                                          worker[
-                                                  'worker_id']
-                                              .toString(),
-                                        );
-
-                                        final isIncluded =
-                                            !_lunchExcludedWorkerIds
-                                                .contains(
-                                          workerId,
-                                        );
-
-                                        final override =
-                                            _lunchOverrides[
-                                                workerId];
-
-                                        return CheckboxListTile(
-                                          dense: true,
-                                          value:
-                                              isIncluded,
-                                          onChanged:
-                                              (checked) =>
-                                                  setState(
-                                            () {
-                                              if (checked ==
-                                                  true) {
-                                                _lunchExcludedWorkerIds
-                                                    .remove(
-                                                  workerId,
-                                                );
-                                              } else {
-                                                _lunchExcludedWorkerIds
-                                                    .add(
-                                                  workerId,
-                                                );
-                                              }
-                                            },
-                                          ),
-                                          title:
-                                              Text(
-                                            worker[
-                                                        'full_name']
-                                                    ?.toString() ??
-                                                'Worker',
-                                            style:
-                                                const TextStyle(
-                                              fontSize:
-                                                  13.5,
-                                              fontWeight:
-                                                  FontWeight
-                                                      .w500,
-                                            ),
-                                          ),
-                                          subtitle:
-                                              override !=
-                                                      null
-                                                  ? Text(
-                                                      'Custom: ${_timeText(override['start'])} - ${_timeText(override['end'])}',
-                                                      style:
-                                                          TextStyle(
-                                                        fontSize:
-                                                            11,
-                                                        color: Colors
-                                                            .blue
-                                                            .shade700,
-                                                        fontWeight:
-                                                            FontWeight
-                                                                .w600,
-                                                      ),
-                                                    )
-                                                  : Text(
-                                                      isIncluded
-                                                          ? 'Uses default lunch time'
-                                                          : 'Excluded — no lunch will be recorded',
-                                                      style:
-                                                          TextStyle(
-                                                        fontSize:
-                                                            11,
-                                                        color: isIncluded
-                                                            ? Colors
-                                                                .grey
-                                                                .shade500
-                                                            : Colors
-                                                                .red
-                                                                .shade400,
-                                                        fontWeight: isIncluded
-                                                            ? FontWeight
-                                                                .normal
-                                                            : FontWeight
-                                                                .w600,
-                                                      ),
-                                                    ),
-                                          secondary:
-                                              IconButton(
-                                            icon:
-                                                Icon(
-                                              Icons
-                                                  .schedule_rounded,
-                                              size: 20,
-                                              color: override !=
-                                                      null
-                                                  ? Colors
-                                                      .blue
-                                                      .shade700
-                                                  : Colors
-                                                      .grey
-                                                      .shade500,
-                                            ),
-                                            tooltip:
-                                                'Set a different lunch time for this worker',
-                                            onPressed:
-                                                () async {
-                                              await _editWorkerLunch(
-                                                workerId,
-                                              );
-
-                                              // إذا حدد وقت خاص، ضمّن العامل تلقائياً حتى لو كان ملغى تعليمه
-                                              if (_lunchOverrides
-                                                  .containsKey(
-                                                workerId,
-                                              )) {
-                                                setState(
-                                                  () => _lunchExcludedWorkerIds
-                                                      .remove(
-                                                    workerId,
-                                                  ),
-                                                );
-                                              }
-                                            },
-                                          ),
-                                        );
-                                      },
-                                    ),
-                                  ),
-                                ],
-                                const SizedBox(
-                                  height: 14,
-                                ),
-                                SizedBox(
-                                  width:
-                                      double.infinity,
-                                  child:
-                                      ElevatedButton
-                                          .icon(
-                                    onPressed:
-                                        _lunchEligibleWorkers
-                                                .isEmpty
-                                            ? null
-                                            : _saveLunchTimes,
-                                    icon:
-                                        const Icon(
-                                      Icons
-                                          .save_alt_rounded,
-                                      size: 18,
-                                    ),
-                                    label:
-                                        const Text(
-                                      'Save Lunch Times',
-                                    ),
-                                    style:
-                                        ElevatedButton
-                                            .styleFrom(
-                                      backgroundColor:
-                                          const Color(
-                                        0xff1a2a6c,
-                                      ),
-                                      foregroundColor:
-                                          Colors.white,
-                                      padding:
-                                          const EdgeInsets
-                                              .symmetric(
-                                        vertical: 12,
-                                      ),
-                                      shape:
-                                          RoundedRectangleBorder(
-                                        borderRadius:
-                                            BorderRadius
-                                                .circular(
-                                          10,
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                      ),
-
-                      _buildWorkersTable(),
+                      _dayHeader(),
+                      ..._banners(),
+                      const SizedBox(height: 8),
+                      _filterChips(),
+                      const SizedBox(height: 8),
+                      _searchField(),
+                      const SizedBox(height: 10),
+                      _workerGrid(),
+                      const SizedBox(height: 12),
+                      if (_lunchEligible.isNotEmpty) _lunchCard(),
                     ],
                   ),
                 ),
+      bottomNavigationBar: _initialLoading ? null : _bottomBar(),
+    );
+  }
 
-                Container(
-                  padding:
-                      const EdgeInsets.all(16.0),
-                  color: Colors.white,
-                  child: SizedBox(
-                    width: double.infinity,
-                    height: 50,
-                    child:
-                        ElevatedButton.icon(
-                      onPressed: _submitDay,
-                      icon: const Icon(
-                        Icons.send_rounded,
-                        color: Colors.white,
-                      ),
-                      label: const Text(
-                        'Submit Day for Review',
-                        style: TextStyle(
-                          fontSize: 15,
-                          fontWeight:
-                              FontWeight.bold,
-                          color: Colors.white,
-                        ),
-                      ),
-                      style:
-                          ElevatedButton.styleFrom(
-                        backgroundColor:
-                            const Color(
-                          0xff1a2a6c,
-                        ),
-                        shape:
-                            RoundedRectangleBorder(
-                          borderRadius:
-                              BorderRadius.circular(
-                            12,
-                          ),
-                        ),
-                        elevation: 2,
-                      ),
-                    ),
-                  ),
-                ),
-              ],
+  Widget _errorState() {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Icon(Icons.cloud_off_rounded, size: 56, color: Colors.grey.shade400),
+          const SizedBox(height: 12),
+          Text(_loadError ?? 'Failed to load.', textAlign: TextAlign.center),
+          const SizedBox(height: 12),
+          ElevatedButton.icon(onPressed: () => _load(initial: true), icon: const Icon(Icons.refresh), label: const Text('Try again')),
+        ]),
+      ),
+    );
+  }
+
+  Widget _card({required Widget child, EdgeInsets padding = const EdgeInsets.all(14), Color? color}) {
+    return Container(
+      padding: padding,
+      decoration: BoxDecoration(
+        color: color ?? Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: const Color(0xffe5e7eb)),
+      ),
+      child: child,
+    );
+  }
+
+  Widget _dayHeader() {
+    final today = DateTime.parse(_businessToday);
+    final isToday = _recordDate == _businessToday;
+    final canNext = _dateObj.isBefore(today);
+    return _card(
+      child: Row(children: [
+        IconButton(
+          tooltip: 'Previous day',
+          onPressed: _busy ? null : () => _changeDate(_dateObj.subtract(const Duration(days: 1))),
+          icon: const Icon(Icons.chevron_left_rounded),
+        ),
+        Expanded(
+          child: InkWell(
+            borderRadius: BorderRadius.circular(10),
+            onTap: _busy ? null : _pickDate,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 6),
+              child: Column(children: [
+                Text(DateFormat('EEEE').format(_dateObj),
+                    style: TextStyle(fontSize: 12, color: Colors.grey.shade600, fontWeight: FontWeight.w600)),
+                Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                  Text(DateFormat('d MMMM yyyy').format(_dateObj),
+                      style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold, color: _primary)),
+                  const SizedBox(width: 6),
+                  const Icon(Icons.edit_calendar_rounded, size: 16, color: _primary),
+                ]),
+                if (_day['week_start'] != null)
+                  Text('Week ${_short(_day['week_start'])} – ${_short(_day['week_end'])}',
+                      style: TextStyle(fontSize: 11, color: Colors.grey.shade500)),
+              ]),
             ),
+          ),
+        ),
+        if (!isToday)
+          TextButton(onPressed: _busy ? null : () => _changeDate(today), child: const Text('Today')),
+        IconButton(
+          tooltip: canNext ? 'Next day' : 'Future dates cannot be recorded',
+          onPressed: (_busy || !canNext) ? null : () => _changeDate(_dateObj.add(const Duration(days: 1))),
+          icon: const Icon(Icons.chevron_right_rounded),
+        ),
+      ]),
+    );
+  }
+
+  String _short(dynamic d) {
+    final s = d?.toString();
+    if (s == null || s.length < 10) return '';
+    return DateFormat('d MMM').format(DateTime.parse(s.substring(0, 10)));
+  }
+
+  List<Widget> _banners() {
+    final list = <Widget>[];
+    if (_locked) {
+      list.add(_banner(
+        icon: Icons.lock_rounded,
+        color: Colors.red.shade700,
+        text: 'Payroll for this date is finalized (batch #${_day['payroll_lock_batch_id']}). Attendance is read-only.',
+        help: HelpTexts.payrollLocked,
+      ));
+    }
+    if (_prevWeekDrafts.isNotEmpty) {
+      final days = _prevWeekDrafts.whereType<Map>().toList();
+      list.add(_card(
+        color: Colors.amber.shade50,
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(children: [
+            Icon(Icons.warning_amber_rounded, color: Colors.amber.shade900),
+            const SizedBox(width: 8),
+            const Expanded(
+              child: Text('Last week still has Draft attendance. Submit it before submitting this day.',
+                  style: TextStyle(fontWeight: FontWeight.w600)),
+            ),
+            const HelpTip(title: 'Previous week rule', message: HelpTexts.previousWeek),
+          ]),
+          const SizedBox(height: 6),
+          Wrap(
+            spacing: 6,
+            runSpacing: 6,
+            children: days.map((d) {
+              final date = d['record_date'].toString();
+              return ActionChip(
+                avatar: const Icon(Icons.open_in_new_rounded, size: 16),
+                label: Text('${DateFormat('EEE d MMM').format(DateTime.parse(date))} · ${d['drafts']} draft'),
+                onPressed: () => _changeDate(DateTime.parse(date)),
+              );
+            }).toList(),
+          ),
+        ]),
+      ));
+    }
+    if (_allSubmitted) {
+      list.add(_banner(
+        icon: Icons.verified_rounded,
+        color: Colors.indigo,
+        text: 'This day has been submitted. The Admin will approve or reject the records.',
+        help: HelpTexts.workflow,
+      ));
+    }
+    return list
+        .map((w) => Padding(padding: const EdgeInsets.only(top: 8), child: w))
+        .toList();
+  }
+
+  Widget _banner({required IconData icon, required Color color, required String text, String? help}) {
+    return _card(
+      color: color.withOpacity(0.07),
+      padding: const EdgeInsets.fromLTRB(12, 8, 4, 8),
+      child: Row(children: [
+        Icon(icon, color: color),
+        const SizedBox(width: 8),
+        Expanded(child: Text(text, style: TextStyle(color: color, fontWeight: FontWeight.w600))),
+        if (help != null) HelpTip(title: 'Why?', message: help, color: color),
+      ]),
+    );
+  }
+
+  Widget _filterChips() {
+    final defs = <(_Filter, String, IconData, Color)>[
+      (_Filter.all, 'All', Icons.groups_rounded, _primary),
+      (_Filter.notRecorded, 'Not recorded', Icons.radio_button_unchecked_rounded, Colors.grey.shade700),
+      (_Filter.working, 'Working', Icons.play_circle_fill_rounded, Colors.green.shade700),
+      (_Filter.onBreak, 'On break', Icons.coffee_rounded, Colors.orange.shade800),
+      (_Filter.checkedOut, 'Checked out', Icons.check_circle_rounded, Colors.blue.shade700),
+      (_Filter.leave, 'Absent / leave', Icons.event_busy_rounded, Colors.purple),
+      (_Filter.submitted, 'Submitted', Icons.send_rounded, Colors.indigo),
+      (_Filter.rejected, 'Rejected', Icons.assignment_late_rounded, Colors.red.shade700),
+      (_Filter.flagged, 'Flagged', Icons.report_rounded, Colors.deepOrange),
+    ];
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      child: Row(
+        children: defs.where((d) => d.$1 == _Filter.all || _count(d.$1) > 0).map((d) {
+          final selected = _filter == d.$1;
+          return Padding(
+            padding: const EdgeInsets.only(right: 6),
+            child: FilterChip(
+              selected: selected,
+              showCheckmark: false,
+              avatar: Icon(d.$3, size: 16, color: selected ? Colors.white : d.$4),
+              label: Text('${d.$2}  ${_count(d.$1)}'),
+              labelStyle: TextStyle(color: selected ? Colors.white : d.$4, fontWeight: FontWeight.w600),
+              selectedColor: d.$4,
+              backgroundColor: Colors.white,
+              side: BorderSide(color: d.$4.withOpacity(0.35)),
+              onSelected: (_) => setState(() => _filter = selected ? _Filter.all : d.$1),
+            ),
+          );
+        }).toList(),
+      ),
+    );
+  }
+
+  Widget _searchField() {
+    final visibleIds = _visible.map(_id).toSet();
+    final allVisibleSelected = visibleIds.isNotEmpty && visibleIds.every(_selected.contains);
+    return Row(children: [
+      Expanded(
+        child: TextField(
+          controller: _search,
+          onChanged: (v) => setState(() => _query = v),
+          decoration: InputDecoration(
+            hintText: 'Search name or worker ID',
+            prefixIcon: const Icon(Icons.search_rounded),
+            suffixIcon: _query.isEmpty
+                ? null
+                : IconButton(
+                    icon: const Icon(Icons.clear_rounded),
+                    onPressed: () {
+                      _search.clear();
+                      setState(() => _query = '');
+                    }),
+            filled: true,
+            fillColor: Colors.white,
+            isDense: true,
+            border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
+          ),
+        ),
+      ),
+      const SizedBox(width: 8),
+      Tooltip(
+        message: allVisibleSelected ? 'Clear selection' : 'Select all shown',
+        child: OutlinedButton.icon(
+          onPressed: _locked || visibleIds.isEmpty
+              ? null
+              : () => setState(() {
+                    if (allVisibleSelected) {
+                      _selected.removeAll(visibleIds);
+                    } else {
+                      _selected.addAll(visibleIds);
+                    }
+                  }),
+          icon: Icon(allVisibleSelected ? Icons.deselect_rounded : Icons.select_all_rounded, size: 18),
+          label: Text(allVisibleSelected ? 'Clear' : 'Select'),
+        ),
+      ),
+    ]);
+  }
+
+  Widget _workerGrid() {
+    final list = _visible;
+    if (list.isEmpty) {
+      return _card(
+        child: SizedBox(
+          height: 160,
+          child: Center(
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              Icon(Icons.person_search_rounded, size: 46, color: Colors.grey.shade400),
+              const SizedBox(height: 8),
+              Text(
+                _workers.isEmpty
+                    ? 'No workers are assigned to this site and shift on this date.'
+                    : 'No worker matches the current filter / search.',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Colors.grey.shade600),
+              ),
+            ]),
+          ),
+        ),
+      );
+    }
+    return LayoutBuilder(builder: (context, c) {
+      final columns = c.maxWidth >= 1100 ? 3 : (c.maxWidth >= 700 ? 2 : 1);
+      const gap = 10.0;
+      final width = (c.maxWidth - gap * (columns - 1)) / columns;
+      return Wrap(
+        spacing: gap,
+        runSpacing: gap,
+        children: list.map((w) => SizedBox(width: width, child: _workerCard(w))).toList(),
+      );
+    });
+  }
+
+  (String, Color, IconData) _stateOf(Map w) {
+    final wf = _workflow(w);
+    final s = w['attendance_status']?.toString();
+    if (w['attendance_id'] == null) return ('Not recorded', Colors.grey.shade600, Icons.radio_button_unchecked_rounded);
+    if (s == 'Absent') return ('Absent', Colors.red.shade700, Icons.person_off_rounded);
+    if (s == 'Sick') return ('Sick leave', Colors.orange.shade800, Icons.sick_rounded);
+    if (s == 'Vacation') return ('Annual leave', Colors.blue.shade700, Icons.beach_access_rounded);
+    if (s == 'Holiday') return ('Holiday', Colors.purple, Icons.event_rounded);
+    if (_onBreak(w)) {
+      return ('On ${(w['current_leave_type'] ?? 'break').toString().toLowerCase()} break', Colors.orange.shade800, Icons.coffee_rounded);
+    }
+    if (_hasIn(w) && !_hasOut(w)) return ('Working', Colors.green.shade700, Icons.play_circle_fill_rounded);
+    if (wf == null) return ('Not recorded', Colors.grey.shade600, Icons.radio_button_unchecked_rounded);
+    return ('Checked out', Colors.blue.shade700, Icons.check_circle_rounded);
+  }
+
+  Widget _workerCard(Map<String, dynamic> w) {
+    final id = _id(w);
+    final name = (w['full_name'] ?? 'Worker').toString();
+    final initials = name.trim().isEmpty ? 'W' : name.trim().substring(0, 1).toUpperCase();
+    final (label, color, icon) = _stateOf(w);
+    final wf = _workflow(w);
+    final selected = _selected.contains(id);
+    final hours = w['total_working_hours'] != null
+        ? (double.tryParse(w['total_working_hours'].toString()) ?? 0) + (double.tryParse((w['overtime_hours'] ?? '0').toString()) ?? 0)
+        : null;
+    final selectable = !_locked && (_canCheckIn(w) || _canCheckOut(w) || _canSetStatus(w));
+
+    Widget? primary;
+    if (_canCheckIn(w)) {
+      primary = Row(children: [
+        Expanded(
+          child: FilledButton.icon(
+            style: FilledButton.styleFrom(backgroundColor: Colors.green.shade700),
+            onPressed: _busy ? null : () => _checkIn(w),
+            icon: const Icon(Icons.login_rounded, size: 18),
+            label: const Text('Check in'),
+          ),
+        ),
+        const SizedBox(width: 8),
+        Expanded(
+          child: OutlinedButton.icon(
+            onPressed: _busy || !_canSetStatus(w) ? null : () => _setStatus(w),
+            icon: const Icon(Icons.event_busy_rounded, size: 18),
+            label: const Text('Absent / leave'),
+          ),
+        ),
+      ]);
+    } else if (_canCheckOut(w)) {
+      primary = Row(children: [
+        Expanded(
+          child: FilledButton.icon(
+            style: FilledButton.styleFrom(backgroundColor: _primary),
+            onPressed: _busy ? null : () => _checkOut(w),
+            icon: const Icon(Icons.logout_rounded, size: 18),
+            label: const Text('Check out'),
+          ),
+        ),
+        const SizedBox(width: 8),
+        Expanded(
+          child: OutlinedButton.icon(
+            onPressed: _busy ? null : () => _toggleBreak(w),
+            icon: const Icon(Icons.coffee_rounded, size: 18),
+            label: const Text('Start break'),
+          ),
+        ),
+      ]);
+    } else if (_canBreak(w) && _onBreak(w)) {
+      primary = SizedBox(
+        width: double.infinity,
+        child: FilledButton.icon(
+          style: FilledButton.styleFrom(backgroundColor: Colors.orange.shade800),
+          onPressed: _busy ? null : () => _toggleBreak(w),
+          icon: const Icon(Icons.timer_off_rounded, size: 18),
+          label: const Text('End break'),
+        ),
+      );
+    }
+
+    final menu = <PopupMenuEntry<String>>[
+      if (_canEditTimes(w)) const PopupMenuItem(value: 'times', child: Text('Edit check-in / check-out')),
+      if (_canSetStatus(w) && w['attendance_id'] != null) const PopupMenuItem(value: 'status', child: Text('Change status')),
+      if (_canBreak(w) && !_onBreak(w) && !_canCheckOut(w)) const PopupMenuItem(value: 'break', child: Text('Start break')),
+      const PopupMenuItem(value: 'transfer', child: Text('Request transfer')),
+    ];
+
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: selected ? _primary : const Color(0xffe5e7eb), width: selected ? 1.6 : 1),
+      ),
+      padding: const EdgeInsets.fromLTRB(6, 8, 6, 10),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Checkbox(
+            value: selected,
+            onChanged: selectable
+                ? (v) => setState(() {
+                      if (v == true) {
+                        _selected.add(id);
+                      } else {
+                        _selected.remove(id);
+                      }
+                    })
+                : null,
+          ),
+          CircleAvatar(
+            radius: 17,
+            backgroundColor: color.withOpacity(0.12),
+            child: Text(initials, style: TextStyle(color: color, fontWeight: FontWeight.bold)),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(name, maxLines: 1, overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 14.5)),
+              Text([w['worker_unique_id'], w['job_position']].where((x) => x != null && x.toString().isNotEmpty).join(' · '),
+                  style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
+            ]),
+          ),
+          if (menu.isNotEmpty && !_locked)
+            PopupMenuButton<String>(
+              tooltip: 'More actions',
+              icon: const Icon(Icons.more_vert_rounded),
+              itemBuilder: (_) => menu,
+              onSelected: (v) {
+                switch (v) {
+                  case 'times':
+                    _editTimes(w);
+                    break;
+                  case 'status':
+                    _setStatus(w);
+                    break;
+                  case 'break':
+                    _toggleBreak(w);
+                    break;
+                  case 'transfer':
+                    _transfer(w);
+                    break;
+                }
+              },
+            ),
+        ]),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Wrap(spacing: 6, runSpacing: 6, children: [
+              StatusPill(label: label, color: color, icon: icon),
+              if (wf != null && wf != 'Draft') StatusPill(label: wf, color: WorkflowColors.of(wf)),
+              if (wf == 'Draft') StatusPill(label: 'Draft', color: WorkflowColors.of('Draft')),
+              if (_isCarryOver(w)) StatusPill(label: 'Started ${_short(w['attendance_record_date'])}', color: Colors.teal, icon: Icons.nights_stay_rounded),
+              if (w['attendance_source'] == 'Biometric') StatusPill(label: 'Biometric', color: Colors.cyan.shade800, icon: Icons.fingerprint_rounded),
+            ]),
+            if (w['attendance_status'] == null || w['attendance_status'] == 'Present') ...[
+              const SizedBox(height: 8),
+              Row(children: [
+                _timeBox('In', '${_hm(w['check_in_time'])}${_dayLabel(w['check_in_time'])}'),
+                _timeBox('Out', '${_hm(w['check_out_time'])}${_dayLabel(w['check_out_time'])}'),
+                _timeBox('Hours', hours == null ? '—' : hours.toStringAsFixed(2)),
+              ]),
+            ],
+            if (w['anomaly_code'] != null) ...[
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.fromLTRB(8, 4, 0, 4),
+                decoration: BoxDecoration(color: Colors.deepOrange.withOpacity(0.08), borderRadius: BorderRadius.circular(8)),
+                child: Row(children: [
+                  const Icon(Icons.report_rounded, size: 16, color: Colors.deepOrange),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text((w['anomaly_detail'] ?? 'Unusually long shift').toString(),
+                        style: const TextStyle(fontSize: 12, color: Colors.deepOrange)),
+                  ),
+                  const HelpTip(title: 'Flagged for review', message: HelpTexts.longShift, size: 16),
+                ]),
+              ),
+            ],
+            if (wf == 'Rejected' && (w['admin_rejection_notes'] ?? '').toString().isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Text('Rejected: ${w['admin_rejection_notes']} — fix it in Rejected Records.',
+                  style: TextStyle(fontSize: 12, color: Colors.red.shade700)),
+            ],
+            if (primary != null) ...[const SizedBox(height: 10), primary],
+          ]),
+        ),
+      ]),
+    );
+  }
+
+  Widget _timeBox(String label, String value) {
+    return Expanded(
+      child: Container(
+        margin: const EdgeInsets.only(right: 6),
+        padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 8),
+        decoration: BoxDecoration(color: const Color(0xfff5f6fa), borderRadius: BorderRadius.circular(8)),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(label, style: TextStyle(fontSize: 10.5, color: Colors.grey.shade600)),
+          Text(value, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
+        ]),
+      ),
+    );
+  }
+
+  Widget _lunchCard() {
+    final eligible = _lunchEligible;
+    final includedCount = eligible.where((w) => !_lunchExcluded.contains(_id(w))).length;
+    return _card(
+      padding: EdgeInsets.zero,
+      child: Theme(
+        data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+        child: ExpansionTile(
+          leading: const Icon(Icons.lunch_dining_rounded, color: _primary),
+          title: const Text('Lunch break (bulk)', style: TextStyle(fontWeight: FontWeight.bold, color: _primary)),
+          subtitle: Text('$includedCount of ${eligible.length} checked-out worker(s) included'),
+          childrenPadding: const EdgeInsets.fromLTRB(14, 0, 14, 14),
+          children: [
+            Text('Set one lunch period for everybody, uncheck anyone who did not take lunch, '
+                'or give a worker a different time.', style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
+            const SizedBox(height: 10),
+            Row(children: [
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: () async {
+                    final t = await showTimePicker(context: context, initialTime: _lunchStart ?? const TimeOfDay(hour: 12, minute: 0));
+                    if (t != null) setState(() => _lunchStart = t);
+                  },
+                  icon: const Icon(Icons.play_arrow_rounded, size: 18),
+                  label: Text('Start ${_t(_lunchStart)}'),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: () async {
+                    final t = await showTimePicker(context: context, initialTime: _lunchEnd ?? const TimeOfDay(hour: 13, minute: 0));
+                    if (t != null) setState(() => _lunchEnd = t);
+                  },
+                  icon: const Icon(Icons.stop_rounded, size: 18),
+                  label: Text('End ${_t(_lunchEnd)}'),
+                ),
+              ),
+            ]),
+            const SizedBox(height: 8),
+            ...eligible.map((w) {
+              final id = _id(w);
+              final included = !_lunchExcluded.contains(id);
+              final o = _lunchOverrides[id];
+              return CheckboxListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                value: included,
+                onChanged: (v) => setState(() {
+                  if (v == true) {
+                    _lunchExcluded.remove(id);
+                  } else {
+                    _lunchExcluded.add(id);
+                  }
+                }),
+                title: Text(w['full_name'].toString()),
+                subtitle: Text(o != null
+                    ? 'Custom ${_t(o['start'])} – ${_t(o['end'])}'
+                    : (included ? (Map.from(w)['lunch_count'].toString() != '0' ? 'Lunch already recorded (will be updated)' : 'Uses the default time') : 'No lunch recorded')),
+                secondary: IconButton(
+                  tooltip: 'Different time for this worker',
+                  icon: Icon(Icons.schedule_rounded, color: o != null ? Colors.blue.shade700 : null),
+                  onPressed: () async {
+                    final s = await showTimePicker(context: context, initialTime: o?['start'] ?? _lunchStart ?? const TimeOfDay(hour: 12, minute: 0), helpText: 'Lunch start');
+                    if (s == null || !mounted) return;
+                    final e = await showTimePicker(context: context, initialTime: o?['end'] ?? _lunchEnd ?? const TimeOfDay(hour: 13, minute: 0), helpText: 'Lunch end');
+                    if (e == null) return;
+                    setState(() {
+                      _lunchOverrides[id] = {'start': s, 'end': e};
+                      _lunchExcluded.remove(id);
+                    });
+                  },
+                ),
+              );
+            }),
+            const SizedBox(height: 6),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton.icon(
+                style: FilledButton.styleFrom(backgroundColor: _primary),
+                onPressed: _busy || _locked ? null : _saveLunch,
+                icon: const Icon(Icons.save_rounded),
+                label: const Text('Save lunch times'),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _bottomBar() {
+    if (_selected.isNotEmpty) {
+      final nIn = _eligible(_canCheckIn).length;
+      final nOut = _eligible(_canCheckOut).length;
+      final nAbs = _eligible(_canSetStatus).length;
+      return SafeArea(
+        child: Container(
+          padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+          decoration: const BoxDecoration(color: _primary),
+          child: Row(children: [
+            Text('${_selected.length} selected', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+            const Spacer(),
+            Wrap(spacing: 6, children: [
+              FilledButton.tonal(onPressed: nIn == 0 || _busy ? null : _bulkCheckIn, child: Text('Check in ($nIn)')),
+              FilledButton.tonal(onPressed: nOut == 0 || _busy ? null : _bulkCheckOut, child: Text('Check out ($nOut)')),
+              FilledButton.tonal(onPressed: nAbs == 0 || _busy ? null : _bulkAbsent, child: Text('Absent ($nAbs)')),
+              IconButton(
+                tooltip: 'Clear selection',
+                onPressed: () => setState(_selected.clear),
+                icon: const Icon(Icons.close_rounded, color: Colors.white),
+              ),
+            ]),
+          ]),
+        ),
+      );
+    }
+    final blockers = _blockers;
+    final canSubmit = !_busy && _hasDraftToSubmit && blockers.isEmpty;
+    final status = !_hasDraftToSubmit
+        ? (_allSubmitted ? 'Day already submitted.' : 'Nothing to submit yet.')
+        : (blockers.isEmpty ? 'Ready to submit.' : 'Before submitting: ${blockers.join(' · ')}');
+    return SafeArea(
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+        decoration: BoxDecoration(color: Colors.white, boxShadow: [
+          BoxShadow(color: Colors.black.withOpacity(0.06), blurRadius: 10, offset: const Offset(0, -2)),
+        ]),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Row(children: [
+            Icon(blockers.isEmpty && _hasDraftToSubmit ? Icons.check_circle_rounded : Icons.info_outline_rounded,
+                size: 16, color: blockers.isEmpty && _hasDraftToSubmit ? Colors.green.shade700 : Colors.grey.shade600),
+            const SizedBox(width: 6),
+            Expanded(child: Text(status, style: TextStyle(fontSize: 12.5, color: Colors.grey.shade700))),
+            const HelpTip(title: 'Submitting a day', message: '${HelpTexts.workflow}\n\n${HelpTexts.previousWeek}', size: 16),
+          ]),
+          const SizedBox(height: 6),
+          SizedBox(
+            width: double.infinity,
+            height: 48,
+            child: FilledButton.icon(
+              style: FilledButton.styleFrom(backgroundColor: _primary),
+              onPressed: canSubmit ? () => _submitDay() : null,
+              icon: const Icon(Icons.send_rounded),
+              label: const Text('Submit day for review', style: TextStyle(fontWeight: FontWeight.bold)),
+            ),
+          ),
+        ]),
+      ),
     );
   }
 }

@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:team_flow/constants.dart';
 import '../widgets/custom_app_bar.dart';
 import '../widgets/app_drawer.dart';
+import '../widgets/help_tip.dart';
 class AdminAttendanceScreen extends StatefulWidget {
   const AdminAttendanceScreen({super.key});
 
@@ -18,6 +19,31 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> {
   Map<String, _SiteGroups> _grouped = {};
   bool _loading = true;
   bool _working = false;
+  // D-12: server-side search / filter.
+  final TextEditingController _searchController = TextEditingController();
+  String _statusFilter = '';      // '' = Submitted + Rejected (server default)
+  bool _onlyAnomalies = false;
+  Map<String, dynamic> _summary = {};
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  Map<String, dynamic>? _itemById(int id) {
+    for (final sites in _grouped.values) {
+      for (final list in sites.values) {
+        for (final item in list) {
+          if ('${item['attendance_id']}' == '$id') return item;
+        }
+      }
+    }
+    return null;
+  }
+
+  bool _hasOpenAnomaly(Map<String, dynamic>? item) =>
+      item != null && item['anomaly_code'] != null && item['anomaly_ack_at'] == null;
 
   @override
   void initState() {
@@ -28,8 +54,16 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> {
   Future<void> _fetchData() async {
     if (mounted) setState(() => _loading = true);
     try {
-      final response = await ApiConfig.dio.get('/admin/attendance/pending');
+      final q = _searchController.text.trim();
+      final response = await ApiConfig.dio.get('/admin/attendance/pending', queryParameters: {
+        if (q.isNotEmpty) 'q': q,
+        if (_statusFilter.isNotEmpty) 'status': _statusFilter,
+        if (_onlyAnomalies) 'anomaly': '1',
+      });
       final raw = response.data is Map ? response.data['data'] : null;
+      final summary = response.data is Map && response.data['summary'] is Map
+          ? Map<String, dynamic>.from(response.data['summary'])
+          : <String, dynamic>{};
 
       // date -> site -> [records]
       final byDate = <String, _SiteGroups>{};
@@ -63,6 +97,7 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> {
       if (!mounted) return;
       setState(() {
         _grouped = ordered;
+        _summary = summary;
         _selectedIds.clear();
         _loading = false;
       });
@@ -90,20 +125,99 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> {
         .toList();
   }
 
+  /// D-09: flagged records need an explicit acknowledgement note to be approved.
+  Future<String?> _askAnomalyAck(List<Map<String, dynamic>> flagged) async {
+    final ctrl = TextEditingController();
+    bool checked = false;
+    String? err;
+    final res = await showDialog<String>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setD) => AlertDialog(
+          title: Row(children: [
+            Icon(Icons.report_problem_rounded, color: Colors.orange.shade800),
+            const SizedBox(width: 8),
+            const Expanded(child: Text('Records need review')),
+            const HelpTip(title: 'Long session', message: HelpTexts.longShift),
+          ]),
+          content: SizedBox(
+            width: 500,
+            child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+              ...flagged.take(8).map((i) => Padding(
+                    padding: const EdgeInsets.only(bottom: 6),
+                    child: Text('• ${i['full_name']} — ${i['record_date']}: ${i['anomaly_detail'] ?? i['anomaly_code']}',
+                        style: const TextStyle(fontSize: 13)),
+                  )),
+              if (flagged.length > 8) Text('…and ${flagged.length - 8} more'),
+              const SizedBox(height: 8),
+              CheckboxListTile(
+                contentPadding: EdgeInsets.zero,
+                value: checked,
+                onChanged: (v) => setD(() => checked = v == true),
+                title: const Text('I checked these times and they are correct'),
+              ),
+              TextField(
+                controller: ctrl,
+                maxLines: 2,
+                decoration: InputDecoration(
+                  labelText: 'Review note (required, min. 5 characters)',
+                  errorText: err,
+                  border: const OutlineInputBorder(),
+                ),
+              ),
+            ]),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+            FilledButton(
+              onPressed: () {
+                if (!checked || ctrl.text.trim().length < 5) {
+                  setD(() => err = 'Tick the confirmation and enter a note');
+                  return;
+                }
+                Navigator.pop(ctx, ctrl.text.trim());
+              },
+              child: const Text('Approve'),
+            ),
+          ],
+        ),
+      ),
+    );
+    ctrl.dispose();
+    return res;
+  }
+
   Future<void> _reviewSelected(List<int> ids, String status, {String? note}) async {
     if (ids.isEmpty || _working) return;
+
+    String? ackNote;
+    if (status == 'Approved') {
+      final flagged = ids.map(_itemById).where(_hasOpenAnomaly).cast<Map<String, dynamic>>().toList();
+      if (flagged.isNotEmpty) {
+        ackNote = await _askAnomalyAck(flagged);
+        if (ackNote == null) return;
+      }
+    }
+
     setState(() => _working = true);
 
     final succeeded = <int>[];
     final failed = <int>[];
+    String? firstError;
     for (final id in ids) {
       try {
+        final flagged = _hasOpenAnomaly(_itemById(id));
         await ApiConfig.dio.post('/admin/attendance/review', data: {
           'attendance_id': id,
           'status': status,
           'admin_note': note,
+          if (flagged && ackNote != null) 'acknowledge_anomaly': true,
+          if (flagged && ackNote != null) 'anomaly_note': ackNote,
         });
         succeeded.add(id);
+      } on DioException catch (e) {
+        failed.add(id);
+        firstError ??= _errorMessage(e, 'Request failed');
       } catch (_) {
         failed.add(id);
       }
@@ -114,9 +228,117 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> {
     if (failed.isEmpty) {
       _showMessage('${succeeded.length} record(s) processed successfully.', true);
     } else {
-      _showMessage('${succeeded.length} succeeded, ${failed.length} failed.', false);
+      _showMessage('${succeeded.length} succeeded, ${failed.length} failed.${firstError != null ? ' $firstError' : ''}', false);
     }
     await _fetchData();
+  }
+
+  /// D-02: Admin correction. Works also inside a finalized payroll period:
+  /// the backend logs the correction and, if the record was already paid in a
+  /// locked batch, opens a payroll adjustment instead of changing payroll.
+  Future<void> _showCorrectionDialog(Map<String, dynamic> item) async {
+    final id = item['attendance_id'];
+    String full(dynamic v) {
+      if (v == null) return '';
+      final t = '$v'.replaceFirst('T', ' ');
+      return t.length >= 16 ? t.substring(0, 16) : t;
+    }
+    final inCtrl = TextEditingController(text: full(item['check_in_time']));
+    final outCtrl = TextEditingController(text: full(item['check_out_time']));
+    final reasonCtrl = TextEditingController();
+    String status = '${item['attendance_status'] ?? 'Present'}';
+    const statuses = ['Present', 'Absent', 'Sick', 'Vacation', 'Holiday'];
+    if (!statuses.contains(status)) status = 'Present';
+    String? err;
+    final dtRe = RegExp(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$');
+
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setD) => AlertDialog(
+          title: Row(children: [
+            Expanded(child: Text('Correct attendance — ${item['full_name'] ?? ''}')),
+            const HelpTip(title: 'Admin correction', message: HelpTexts.payrollLocked),
+          ]),
+          content: SizedBox(
+            width: 460,
+            child: SingleChildScrollView(
+              child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text('Record date: ${item['record_date']} · ${item['site_name']} (${item['shift_type'] ?? 'Day'})',
+                    style: TextStyle(color: Colors.grey.shade700)),
+                const SizedBox(height: 12),
+                DropdownButtonFormField<String>(
+                  value: status,
+                  decoration: const InputDecoration(labelText: 'Attendance status', border: OutlineInputBorder()),
+                  items: statuses.map((s) => DropdownMenuItem(value: s, child: Text(s))).toList(),
+                  onChanged: (v) => setD(() => status = v ?? status),
+                ),
+                if (status == 'Present') ...[
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: inCtrl,
+                    decoration: const InputDecoration(
+                        labelText: 'Check-in (YYYY-MM-DD HH:MM)', border: OutlineInputBorder()),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: outCtrl,
+                    decoration: const InputDecoration(
+                        labelText: 'Check-out (YYYY-MM-DD HH:MM)',
+                        helperText: 'Night shift: check-out may be on the next day',
+                        border: OutlineInputBorder()),
+                  ),
+                ],
+                const SizedBox(height: 12),
+                TextField(
+                  controller: reasonCtrl,
+                  maxLines: 2,
+                  decoration: InputDecoration(
+                      labelText: 'Reason (required)', errorText: err, border: const OutlineInputBorder()),
+                ),
+              ]),
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+            FilledButton(
+              onPressed: () {
+                if (reasonCtrl.text.trim().length < 5) {
+                  setD(() => err = 'Enter a reason (min. 5 characters)');
+                  return;
+                }
+                if (status == 'Present' &&
+                    (!dtRe.hasMatch(inCtrl.text.trim()) ||
+                        (outCtrl.text.trim().isNotEmpty && !dtRe.hasMatch(outCtrl.text.trim())))) {
+                  setD(() => err = 'Times must look like 2026-10-01 07:30');
+                  return;
+                }
+                Navigator.pop(ctx, true);
+              },
+              child: const Text('Save correction'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (ok == true) {
+      try {
+        final r = await ApiConfig.dio.post('/attendance/$id/admin-correction', data: {
+          'reason': reasonCtrl.text.trim(),
+          'attendance_status': status,
+          if (status == 'Present') 'check_in_time': '${inCtrl.text.trim()}:00',
+          if (status == 'Present' && outCtrl.text.trim().isNotEmpty) 'check_out_time': '${outCtrl.text.trim()}:00',
+        });
+        final msg = r.data is Map ? (r.data['message'] ?? 'Correction saved').toString() : 'Correction saved';
+        _showMessage(msg, true);
+        await _fetchData();
+      } on DioException catch (e) {
+        _showMessage(_errorMessage(e, 'Failed to save the correction.'), false);
+      }
+    }
+    inCtrl.dispose();
+    outCtrl.dispose();
+    reasonCtrl.dispose();
   }
 
   Future<String?> _promptForReason(BuildContext context) async {
@@ -283,63 +505,147 @@ Future<void> _showManagementLeaveDialog(
   }
 }
 
+  /// D-08 / D-14: effective-dated settings. Changes apply from "Effective from";
+  /// a back-dated change needs a reason and is refused inside finalized payroll.
   Future<void> _showSettingsDialog() async {
-    bool lunchPaid = false;
-    int minutes = 480;
+    Map data = {};
+    String today = '';
     try {
       final response = await ApiConfig.dio.get('/admin/attendance/settings/breaks');
-      final data = response.data is Map ? response.data['data'] : null;
-      if (data is Map) {
-        lunchPaid = '${data['is_lunch_paid']}'.toLowerCase() == 'true';
-        minutes = int.tryParse('${data['standard_work_minutes']}') ?? 600;
-      }
+      if (response.data is Map && response.data['data'] is Map) data = response.data['data'];
+      today = response.data is Map ? '${response.data['business_today'] ?? ''}' : '';
     } catch (_) {
       if (mounted) _showMessage('Failed to load settings.', false);
       return;
     }
     if (!mounted) return;
 
-    final minutesController = TextEditingController(text: '$minutes');
+    bool lunchPaid = '${data['is_lunch_paid']}'.toLowerCase() == 'true';
+    final minutesCtrl = TextEditingController(text: '${data['standard_work_minutes'] ?? ''}');
+    final otRateCtrl = TextEditingController(text: data['overtime_flat_rate_syp'] == null ? '' : '${data['overtime_flat_rate_syp']}');
+    final longShiftCtrl = TextEditingController(text: '${data['long_shift_review_hours'] ?? 16}');
+    final reasonCtrl = TextEditingController();
+    int weekStart = int.tryParse('${data['attendance_week_start_day'] ?? 6}') ?? 6;
+    DateTime effective = DateTime.tryParse(today) ?? DateTime.now();
+    final todayDate = DateTime.tryParse(today) ?? DateTime.now();
+    const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    String fmt(DateTime d) =>
+        '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+
     await showDialog<void>(
       context: context,
       builder: (dialogContext) => StatefulBuilder(
         builder: (context, setDialogState) => AlertDialog(
-          title: const Text('Attendance settings'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              SwitchListTile.adaptive(
-                contentPadding: EdgeInsets.zero,
-                title: const Text('Lunch is paid'),
-                value: lunchPaid,
-                onChanged: (value) => setDialogState(() => lunchPaid = value),
+          title: const Row(children: [
+            Expanded(child: Text('Attendance & payroll settings')),
+            HelpTip(
+              title: 'How settings apply',
+              message: 'Each change is stored with an "Effective from" date and kept in history. '
+                  'Records already Submitted or Approved on/after that date are never recalculated silently. '
+                  'A back-dated date needs a reason and cannot fall inside a finalized payroll period.',
+            ),
+          ]),
+          content: SizedBox(
+            width: 460,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SwitchListTile.adaptive(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Lunch is paid'),
+                    value: lunchPaid,
+                    onChanged: (value) => setDialogState(() => lunchPaid = value),
+                  ),
+                  TextField(
+                    controller: minutesCtrl,
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(labelText: 'Standard work minutes per day', border: OutlineInputBorder()),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: otRateCtrl,
+                    keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                    decoration: const InputDecoration(
+                      labelText: 'Overtime rate (SYP per hour, workers)',
+                      helperText: 'Required before worker payroll can be generated',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: longShiftCtrl,
+                    keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                    decoration: const InputDecoration(
+                      labelText: 'Long-session review threshold (hours)',
+                      helperText: 'Warning only — never changes the record or the shift',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  DropdownButtonFormField<int>(
+                    value: weekStart,
+                    decoration: const InputDecoration(labelText: 'Attendance week starts on', border: OutlineInputBorder()),
+                    items: List.generate(7, (i) => DropdownMenuItem(value: i, child: Text(days[i]))),
+                    onChanged: (v) => setDialogState(() => weekStart = v ?? weekStart),
+                  ),
+                  const SizedBox(height: 12),
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: const Icon(Icons.event),
+                    title: Text('Effective from: ${fmt(effective)}'),
+                    trailing: const Icon(Icons.edit_calendar),
+                    onTap: () async {
+                      final d = await showDatePicker(
+                        context: context,
+                        initialDate: effective,
+                        firstDate: DateTime(2024),
+                        lastDate: todayDate,
+                      );
+                      if (d != null) setDialogState(() => effective = d);
+                    },
+                  ),
+                  TextField(
+                    controller: reasonCtrl,
+                    decoration: const InputDecoration(
+                      labelText: 'Reason (required when back-dated)',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ],
               ),
-              TextField(
-                controller: minutesController,
-                keyboardType: TextInputType.number,
-                decoration: const InputDecoration(
-                  labelText: 'Standard work minutes',
-                  border: OutlineInputBorder(),
-                ),
-              ),
-            ],
+            ),
           ),
           actions: [
             TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancel')),
             FilledButton(
               onPressed: () async {
-                final value = int.tryParse(minutesController.text.trim());
+                final value = int.tryParse(minutesCtrl.text.trim());
                 if (value == null || value <= 0 || value > 1440) {
                   _showMessage('Minutes must be between 1 and 1440.', false);
                   return;
                 }
+                final body = <String, dynamic>{
+                  'is_lunch_paid': lunchPaid,
+                  'standard_work_minutes': value,
+                  'attendance_week_start_day': weekStart,
+                  'effective_from': fmt(effective),
+                  if (reasonCtrl.text.trim().isNotEmpty) 'reason': reasonCtrl.text.trim(),
+                };
+                if (otRateCtrl.text.trim().isNotEmpty) {
+                  final ot = double.tryParse(otRateCtrl.text.trim());
+                  if (ot == null || ot < 0) {
+                    _showMessage('Overtime rate must be a positive number.', false);
+                    return;
+                  }
+                  body['overtime_flat_rate_syp'] = ot;
+                }
+                final ls = double.tryParse(longShiftCtrl.text.trim());
+                if (ls != null) body['long_shift_review_hours'] = ls;
                 try {
-                  await ApiConfig.dio.put('/admin/attendance/settings/breaks', data: {
-                    'is_lunch_paid': lunchPaid,
-                    'standard_work_minutes': value,
-                  });
+                  await ApiConfig.dio.put('/admin/attendance/settings/breaks', data: body);
                   if (dialogContext.mounted) Navigator.pop(dialogContext);
-                  if (mounted) _showMessage('Settings updated.', true);
+                  if (mounted) _showMessage('Settings saved (effective ${fmt(effective)}).', true);
                 } on DioException catch (e) {
                   if (mounted) _showMessage(_errorMessage(e, 'Failed to update settings.'), false);
                 }
@@ -350,7 +656,10 @@ Future<void> _showManagementLeaveDialog(
         ),
       ),
     );
-    minutesController.dispose();
+    minutesCtrl.dispose();
+    otRateCtrl.dispose();
+    longShiftCtrl.dispose();
+    reasonCtrl.dispose();
   }
 
   void _showMessage(String message, bool success) {
@@ -508,6 +817,30 @@ Future<void> _showManagementLeaveDialog(
                   ),
               ],
             ),
+            if (item['anomaly_code'] != null) ...[
+              const SizedBox(height: 8),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: item['anomaly_ack_at'] == null ? Colors.orange.shade50 : Colors.grey.shade100,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Row(children: [
+                  Icon(Icons.report_problem_rounded, size: 16,
+                      color: item['anomaly_ack_at'] == null ? Colors.orange.shade800 : Colors.grey),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      item['anomaly_ack_at'] == null
+                          ? 'Needs review: ${item['anomaly_detail'] ?? item['anomaly_code']}'
+                          : 'Reviewed: ${item['anomaly_ack_note'] ?? ''}',
+                      style: TextStyle(fontSize: 12, color: Colors.orange.shade900),
+                    ),
+                  ),
+                ]),
+              ),
+            ],
             if (rejected && item['admin_rejection_notes'] != null) ...[
               const SizedBox(height: 8),
               Container(
@@ -524,7 +857,7 @@ Future<void> _showManagementLeaveDialog(
             Row(
               mainAxisAlignment: MainAxisAlignment.end,
               children: [
-                if (!rejected)
+                if (status == 'Submitted')
                   TextButton.icon(
                     onPressed: _working ? null : () => _reviewSelected([id], 'Approved'),
                     icon: const Icon(Icons.check, size: 16),
@@ -533,7 +866,7 @@ Future<void> _showManagementLeaveDialog(
                   ),
              // B6: biometric records can be rejected like manual ones; the
              // supervisor corrects and resubmits them.
-             if (!rejected)
+             if (status == 'Submitted')
   TextButton.icon(
     onPressed: _working
         ? null
@@ -550,6 +883,12 @@ Future<void> _showManagementLeaveDialog(
       padding: const EdgeInsets.symmetric(horizontal: 8),
     ),
   ),
+     IconButton(
+  tooltip: 'Correct attendance (Admin)',
+  visualDensity: VisualDensity.compact,
+  icon: const Icon(Icons.edit_note_rounded, size: 20, color: Colors.indigo),
+  onPressed: () => _showCorrectionDialog(item),
+),
      IconButton(
   tooltip: 'Management leave',
   visualDensity: VisualDensity.compact,
@@ -823,6 +1162,66 @@ Widget _siteSection(String date, String siteName, List<Map<String, dynamic>> ite
   );
 }
 
+  Widget _filterBar() {
+    const filters = [
+      ('', 'Pending + Rejected'),
+      ('Submitted', 'Submitted'),
+      ('Rejected', 'Rejected'),
+      ('Approved', 'Approved'),
+      ('Draft', 'Draft'),
+    ];
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Row(children: [
+        Expanded(
+          child: TextField(
+            controller: _searchController,
+            textInputAction: TextInputAction.search,
+            onSubmitted: (_) => _fetchData(),
+            decoration: InputDecoration(
+              hintText: 'Search worker name or ID, then press Enter',
+              prefixIcon: const Icon(Icons.search),
+              suffixIcon: _searchController.text.isEmpty
+                  ? null
+                  : IconButton(
+                      icon: const Icon(Icons.clear),
+                      onPressed: () {
+                        _searchController.clear();
+                        _fetchData();
+                      },
+                    ),
+              isDense: true,
+              filled: true,
+              fillColor: Colors.white,
+              border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide(color: Colors.grey.shade300)),
+            ),
+          ),
+        ),
+        const HelpTip(title: 'Attendance workflow', message: HelpTexts.workflow),
+      ]),
+      const SizedBox(height: 8),
+      Wrap(spacing: 6, runSpacing: 6, children: [
+        for (final f in filters)
+          ChoiceChip(
+            label: Text(f.$2),
+            selected: _statusFilter == f.$1,
+            onSelected: (_) {
+              setState(() => _statusFilter = f.$1);
+              _fetchData();
+            },
+          ),
+        FilterChip(
+          avatar: const Icon(Icons.report_problem_rounded, size: 16),
+          label: const Text('Needs review only'),
+          selected: _onlyAnomalies,
+          onSelected: (v) {
+            setState(() => _onlyAnomalies = v);
+            _fetchData();
+          },
+        ),
+      ]),
+    ]);
+  }
+
   Widget _dateSection(String date, _SiteGroups sites) {
     final allItemsForDate = sites.values.expand((v) => v).toList();
     final ids = _idsOf(allItemsForDate);
@@ -866,8 +1265,9 @@ Widget _siteSection(String date, String siteName, List<Map<String, dynamic>> ite
   @override
   Widget build(BuildContext context) {
     final allItems = _grouped.values.expand((sites) => sites.values.expand((v) => v)).toList();
-    final pending = allItems.where((i) => '${i['status']}' == 'Submitted').length;
-    final rejected = allItems.where((i) => '${i['status']}' == 'Rejected').length;
+    final pending = _summary['submitted'] ?? allItems.where((i) => '${i['status']}' == 'Submitted').length;
+    final rejected = _summary['rejected'] ?? allItems.where((i) => '${i['status']}' == 'Rejected').length;
+    final anomaliesOpen = _summary['anomalies_open'] ?? allItems.where(_hasOpenAnomaly).length;
     final overtimeTotal = allItems.where((i) => (double.tryParse('${i['overtime_hours'] ?? 0}') ?? 0) > 0).length;
 
     return Scaffold(
@@ -882,20 +1282,31 @@ Widget _siteSection(String date, String siteName, List<Map<String, dynamic>> ite
           ? const Center(child: CircularProgressIndicator())
           : RefreshIndicator(
               onRefresh: _fetchData,
-              child: _grouped.isEmpty
-                  ? ListView(children: const [SizedBox(height: 220), Center(child: Text('No attendance records to review.'))])
-                  : ListView(
+              child: ListView(
                       padding: const EdgeInsets.fromLTRB(16, 18, 16, 30),
                       children: [
+                        _filterBar(),
+                        const SizedBox(height: 12),
+                        if (_grouped.isEmpty)
+                          const Padding(
+                            padding: EdgeInsets.symmetric(vertical: 80),
+                            child: Center(child: Text('No attendance records match these filters.')),
+                          ),
                         LayoutBuilder(builder: (context, constraints) {
                           final cards = [
                             _summaryCard('Submitted', '$pending', Icons.pending_actions, Colors.orange),
                             _summaryCard('Rejected', '$rejected', Icons.warning_amber, Colors.red),
                             _summaryCard('With Overtime', '$overtimeTotal', Icons.bolt_rounded, Colors.deepPurple),
+                            _summaryCard('Needs review', '$anomaliesOpen', Icons.report_problem_rounded, Colors.deepOrange),
                           ];
                           return constraints.maxWidth < 650
                               ? Column(children: cards.map((card) => Padding(padding: const EdgeInsets.only(bottom: 8), child: card)).toList())
-                              : Row(children: [Expanded(child: cards[0]), const SizedBox(width: 10), Expanded(child: cards[1]), const SizedBox(width: 10), Expanded(child: cards[2])]);
+                              : Row(children: [
+                                  for (var i = 0; i < cards.length; i++) ...[
+                                    if (i > 0) const SizedBox(width: 10),
+                                    Expanded(child: cards[i]),
+                                  ],
+                                ]);
                         }),
                         const SizedBox(height: 10),
                         ..._grouped.entries.map((entry) => _dateSection(entry.key, entry.value)),

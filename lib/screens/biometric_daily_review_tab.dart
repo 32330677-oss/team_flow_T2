@@ -176,6 +176,17 @@ class _BiometricDailyReviewTabState extends State<BiometricDailyReviewTab>
         fallbackDate: _date,
       );
       if (saved) await _load();
+    } else if (action == 'restore_for_processing') {
+      final reason = await _askText('Restore for processing', 'Reason',
+          hint: 'This punch is older than the processing window. Restoring lets the next run process it '
+              'normally. The decision is recorded.');
+      if (reason == null) return;
+      await _runAction(() => _service.restoreItem(item.punchId, reason));
+    } else if (action == 'requeue') {
+      final reason = await _askText('Re-queue punch', 'Reason',
+          hint: 'The punch was dismissed while unmapped. It is processed again with the employee mapping valid on its own date.');
+      if (reason == null) return;
+      await _runAction(() => _service.requeueItem(item.punchId, reason));
     } else if (action == 'map_employee') {
       await Navigator.push(context, MaterialPageRoute(builder: (_) => const DeviceIdMappingScreen()));
       if (mounted) _load();

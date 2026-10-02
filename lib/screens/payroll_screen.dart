@@ -6,9 +6,18 @@ import 'package:intl/intl.dart';
 import 'payroll_export_service.dart';
 import '../widgets/custom_app_bar.dart';
 import '../widgets/monthly_report_card.dart';
+import '../widgets/help_tip.dart';
 String formatSyp(dynamic value) {
   final amount = double.tryParse(value?.toString() ?? '0') ?? 0;
   return '${NumberFormat('#,##0', 'en_US').format(amount)} ل.س';
+}
+
+/// D-10: each batch carries its own currency. Worker batches are SYP.
+String formatMoney(dynamic value, dynamic currency) {
+  final cur = (currency ?? 'SYP').toString().toUpperCase();
+  if (cur == 'SYP') return formatSyp(value);
+  final amount = double.tryParse(value?.toString() ?? '0') ?? 0;
+  return '${NumberFormat('#,##0.00', 'en_US').format(amount)} $cur';
 }
 
 class PayrollScreen extends StatefulWidget {
@@ -32,6 +41,7 @@ class _PayrollScreenState extends State<PayrollScreen> {
   bool _isLoadingSites = true;
 
   List<dynamic> _payrollBatches = [];
+  bool _includeHistory = false;
   List<dynamic> _filteredBatches = [];
   List<dynamic> _sites = [];
 
@@ -101,6 +111,7 @@ class _PayrollScreenState extends State<PayrollScreen> {
       if (_selectedSiteId != null) {
         queryParams['site_id'] = _selectedSiteId;
       }
+      if (_includeHistory) queryParams['include_history'] = '1';
 
       final response = await ApiConfig.dio.get(
         '/admin/payroll/report',
@@ -137,7 +148,158 @@ class _PayrollScreenState extends State<PayrollScreen> {
     });
   }
 
-  Future<void> _generatePayroll() async {
+  /// C-03: the server refuses to generate while attendance in the period is
+  /// not approved, and returns the list. The Admin either fixes it first or
+  /// explicitly confirms that those records are NOT paid in this batch.
+  Future<bool> _confirmPendingAttendance(Map data) async {
+    final List rows = (data['pending_attendance'] as List?) ?? [];
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Unapproved attendance in this period'),
+        content: SizedBox(
+          width: 520,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(data['message']?.toString() ?? ''),
+              const SizedBox(height: 10),
+              Flexible(
+                child: ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: rows.length > 50 ? 50 : rows.length,
+                  itemBuilder: (_, i) {
+                    final r = rows[i];
+                    return ListTile(
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      title: Text('${r['full_name']} · ${r['site_name']} (${r['shift_type'] ?? 'Day'})'),
+                      subtitle: Text('${r['record_date']}'),
+                      trailing: StatusPill(label: '${r['status']}', color: WorkflowColors.of(r['status']?.toString())),
+                    );
+                  },
+                ),
+              ),
+              if (rows.length > 50)
+                Text('…and ${rows.length - 50} more', style: TextStyle(color: Colors.grey.shade600)),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel — review first')),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.orange.shade800),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Generate without them', style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+    return ok == true;
+  }
+
+  Future<String?> _reasonDialog(String title, String message, String confirmLabel, Color color) async {
+    final ctrl = TextEditingController();
+    String? err;
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setD) => AlertDialog(
+          title: Text(title),
+          content: SizedBox(
+            width: 460,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(message),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: ctrl,
+                  maxLines: 3,
+                  decoration: InputDecoration(
+                    labelText: 'Reason (required, min. 5 characters)',
+                    errorText: err,
+                    border: const OutlineInputBorder(),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(backgroundColor: color),
+              onPressed: () {
+                if (ctrl.text.trim().length < 5) {
+                  setD(() => err = 'Please enter a clear reason');
+                  return;
+                }
+                Navigator.pop(ctx, ctrl.text.trim());
+              },
+              child: Text(confirmLabel, style: const TextStyle(color: Colors.white)),
+            ),
+          ],
+        ),
+      ),
+    );
+    ctrl.dispose();
+    return result;
+  }
+
+  /// D-03: void a Generated (not finalized) batch. Nothing is deleted.
+  Future<void> _voidBatch(int batchId) async {
+    final reason = await _reasonDialog(
+      'Void batch #$batchId',
+      'Use this only for a batch generated by mistake. The batch stays in the history as "Voided" '
+          'and its period can be generated again. Finalized or paid batches cannot be voided.',
+      'Void batch',
+      dangerColor,
+    );
+    if (reason == null) return;
+    try {
+      final r = await ApiConfig.dio.patch('/admin/payroll/batch/$batchId/void', data: {'reason': reason});
+      _showSnack(r.data['message']?.toString() ?? 'Batch voided', Colors.blueGrey);
+      _fetchPayrollReports();
+      _fetchLastBatchDate();
+    } on DioException catch (e) {
+      _showSnack(e.response?.data is Map ? (e.response?.data['message'] ?? 'Failed to void batch').toString() : 'Failed to void batch', dangerColor);
+    }
+  }
+
+  /// D-03: correct a finalized, unpaid batch. Generation, verification and
+  /// superseding happen in one server transaction; the old batch is only
+  /// marked Superseded if the replacement was created successfully.
+  Future<void> _supersedeBatch(int batchId, {bool acknowledgePending = false, String? reason}) async {
+    reason ??= await _reasonDialog(
+      'Correct (supersede) batch #$batchId',
+      'A new version is generated for the same period and site from the current approved attendance. '
+          'This batch is kept as "Superseded" for audit. Paid batches can never be superseded.',
+      'Generate new version',
+      Colors.indigo,
+    );
+    if (reason == null) return;
+    try {
+      final r = await ApiConfig.dio.post('/admin/payroll/batch/$batchId/supersede', data: {
+        'reason': reason,
+        if (acknowledgePending) 'acknowledge_pending': true,
+      });
+      _showSnack(r.data['message']?.toString() ?? 'New version generated', Colors.green.shade700);
+      _fetchPayrollReports();
+    } on DioException catch (e) {
+      final data = e.response?.data;
+      if (data is Map && data['code'] == 'PENDING_ATTENDANCE' && !acknowledgePending) {
+        if (await _confirmPendingAttendance(data)) {
+          await _supersedeBatch(batchId, acknowledgePending: true, reason: reason);
+        }
+        return;
+      }
+      _showSnack(data is Map ? (data['message'] ?? 'Failed to supersede batch').toString() : 'Failed to supersede batch', dangerColor);
+    }
+  }
+
+  Future<void> _generatePayroll({bool acknowledgePending = false}) async {
     if (_startDateController.text.isEmpty || _endDateController.text.isEmpty) {
       _showSnack('Please select start and end dates', Colors.orange);
       return;
@@ -148,6 +310,7 @@ class _PayrollScreenState extends State<PayrollScreen> {
         'start_date': _startDateController.text,
         'end_date': _endDateController.text,
         if (_selectedSiteId != null) 'site_id': _selectedSiteId,
+        if (acknowledgePending) 'acknowledge_pending': true,
       });
       if (response.data['success'] == true || response.statusCode == 200 || response.statusCode == 201) {
         _showSnack('Payroll batch generated successfully', Colors.green);
@@ -159,13 +322,21 @@ class _PayrollScreenState extends State<PayrollScreen> {
     } catch (e) {
       String errorMessage = 'Error generating payroll';
 
-      if (e is DioException && e.response?.data != null) {
-        errorMessage = e.response?.data['message'] ?? errorMessage;
+      if (e is DioException && e.response?.data is Map) {
+        final data = e.response!.data as Map;
+        if (data['code'] == 'PENDING_ATTENDANCE' && !acknowledgePending) {
+          if (mounted) setState(() => _isGenerating = false);
+          if (await _confirmPendingAttendance(data)) {
+            await _generatePayroll(acknowledgePending: true);
+          }
+          return;
+        }
+        errorMessage = (data['message'] ?? errorMessage).toString();
       }
 
       _showSnack(errorMessage, Colors.orange[800]!);
     } finally {
-      setState(() => _isGenerating = false);
+      if (mounted) setState(() => _isGenerating = false);
     }
   }
 
@@ -307,8 +478,11 @@ Future<void> _selectDate(TextEditingController controller, {bool isStartDate = f
         builder: (ctx) => AlertDialog(
           title: const Text('Overlapping Period'),
           content: const Text(
-            'This start date overlaps a previous payroll period. '
-            'If you generate payroll for this range, the existing batch for that period will be superseded (versioned) automatically. Continue?',
+            'This start date overlaps an existing payroll period.\n\n'
+            '• Not finalized batch for the SAME period and site: it is replaced by a new version.\n'
+            '• Finalized batch: generation is refused — use "Correct (supersede)" on that batch with a reason.\n'
+            '• Paid batch: can never be regenerated; differences go through attendance corrections.\n\n'
+            'Continue?',
           ),
           actions: [
             TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
@@ -475,12 +649,36 @@ Future<void> _selectDate(TextEditingController controller, {bool isStartDate = f
                       children: [
                         Text('Total Workers: ${batch['total_workers'] ?? workers.length}',
                             style: const TextStyle(fontWeight: FontWeight.w600)),
-                        Text('Total Amount: ${formatSyp(batch['total_amount'])}',
+                        Text('Total Amount: ${formatMoney(batch['total_amount'], batch['currency'])}',
                             style: const TextStyle(fontWeight: FontWeight.bold, color: primaryColor, fontSize: 16)),
                       ],
                     ),
                   ),
-                if ((batch['status'] ?? 'Pending') != 'Paid') ...[
+                if ((batch['status'] ?? 'Pending') == 'Generated' &&
+                    !(batch['is_finalized'] == 1 || batch['is_finalized'] == true)) ...[
+                  TextButton.icon(
+                    onPressed: () {
+                      Navigator.pop(context);
+                      _voidBatch(batch['payroll_batch_id']);
+                    },
+                    icon: const Icon(Icons.block, color: dangerColor, size: 18),
+                    label: const Text('Void', style: TextStyle(color: dangerColor)),
+                  ),
+                  const SizedBox(width: 8),
+                ],
+                if ((batch['status'] ?? 'Pending') == 'Generated' &&
+                    (batch['is_finalized'] == 1 || batch['is_finalized'] == true)) ...[
+                  OutlinedButton.icon(
+                    onPressed: () {
+                      Navigator.pop(context);
+                      _supersedeBatch(batch['payroll_batch_id']);
+                    },
+                    icon: const Icon(Icons.published_with_changes, size: 18),
+                    label: const Text('Correct (supersede)'),
+                  ),
+                  const SizedBox(width: 8),
+                ],
+                if ((batch['status'] ?? 'Pending') == 'Generated') ...[
   if (!(batch['is_finalized'] == 1 || batch['is_finalized'] == true))
     ElevatedButton.icon(
       onPressed: () async {
@@ -623,8 +821,20 @@ Future<void> _exportBatchPdf(Map batch) async {
   }
 
   Widget _statusChip(String status) {
-    final isPaid = status == 'Paid';
-    final color = isPaid ? Colors.green : Colors.orange;
+    final Color color;
+    switch (status) {
+      case 'Paid':
+        color = Colors.green;
+        break;
+      case 'Superseded':
+        color = Colors.blueGrey;
+        break;
+      case 'Voided':
+        color = Colors.red;
+        break;
+      default:
+        color = Colors.orange;
+    }
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
       decoration: BoxDecoration(color: color.withOpacity(0.12), borderRadius: BorderRadius.circular(20)),
@@ -676,8 +886,25 @@ Future<void> _exportBatchPdf(Map batch) async {
               const SizedBox(height: 20),
               Row(
                 children: [
-                  const Text('Payroll History', style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold, color: primaryColor)),
-                  const Spacer(),
+                  const Flexible(child: Text('Payroll History', overflow: TextOverflow.ellipsis, style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold, color: primaryColor))),
+                  const HelpTip(
+                    title: 'Payroll batch states',
+                    message: 'Generated: created, can be regenerated or voided while not finalized.\n'
+                        'Finalized: approved; attendance in the period is locked. Can only be corrected with "Correct (supersede)".\n'
+                        'Paid: final. Never regenerated or reopened.\n'
+                        'Superseded / Voided: kept for audit only (shown with "Show history").',
+                  ),
+                  const SizedBox(width: 4),
+                  FilterChip(
+                    visualDensity: VisualDensity.compact,
+                    label: const Text('Show history'),
+                    selected: _includeHistory,
+                    onSelected: (v) {
+                      setState(() => _includeHistory = v);
+                      _fetchPayrollReports();
+                    },
+                  ),
+                  const SizedBox(width: 8),
                   Text('${_filteredBatches.length} batches', style: TextStyle(color: Colors.grey.shade600, fontSize: 12)),
                 ],
               ),
@@ -740,7 +967,7 @@ Future<void> _exportBatchPdf(Map batch) async {
                                 ),
                                subtitle: Text(
   'v${batch['version_number'] ?? 1} • Period: ${_formatDate(batch['start_date'])} → ${_formatDate(batch['end_date'])}\n'
-  'Workers: ${batch['total_workers']} • Total: ${formatSyp(batch['total_amount'])} • By: ${batch['generated_by'] ?? 'Admin'}'
+  'Workers: ${batch['total_workers']} • Total: ${formatMoney(batch['total_amount'], batch['currency'])} • By: ${batch['generated_by'] ?? 'Admin'}'
   '${(batch['is_finalized'] == 1 || batch['is_finalized'] == true) ? '' : ' • Not Finalized'}',
 ),
                                 isThreeLine: true,

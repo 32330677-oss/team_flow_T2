@@ -29,6 +29,14 @@ String? _selectedCurrentShiftType;
 String? _selectedTargetShiftType;
   // B3: the business date the transfer should take effect (default today).
   DateTime _effectiveDate = DateTime.now();
+  // C-11: a reason is mandatory for every transfer request.
+  final TextEditingController _reasonController = TextEditingController();
+
+  @override
+  void dispose() {
+    _reasonController.dispose();
+    super.dispose();
+  }
 
   String get _effectiveDateStr =>
       '${_effectiveDate.year.toString().padLeft(4, '0')}-${_effectiveDate.month.toString().padLeft(2, '0')}-${_effectiveDate.day.toString().padLeft(2, '0')}';
@@ -290,10 +298,16 @@ if (_selectedWorker == null ||
   return;
 }
 
+  if (_reasonController.text.trim().length < 5) {
+    _showSnack('Please enter the reason for the transfer (min. 5 characters)', Colors.orange);
+    return;
+  }
+
   setState(() => _isSubmitting = true);
 
   try {
  final response = await ApiConfig.dio.post('/transfers', data: {
+  'transfer_reason': _reasonController.text.trim(),
   'worker_id': _selectedWorker!['worker_id'],
   'current_site_id': _selectedCurrentSite!['site_id'],
   'current_shift_type': _selectedCurrentShiftType,
@@ -462,7 +476,20 @@ _buildSelector(
   value: _effectiveDateStr,
   onTap: _pickEffectiveDate,
 ),
-const SizedBox(height: 28),
+const SizedBox(height: 16),
+TextField(
+  controller: _reasonController,
+  maxLines: 3,
+  maxLength: 500,
+  decoration: InputDecoration(
+    labelText: 'Reason for transfer (required)',
+    hintText: 'Why should this worker move?',
+    filled: true,
+    fillColor: Colors.white,
+    border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+  ),
+),
+const SizedBox(height: 20),
                   ElevatedButton.icon(
                     onPressed: _isSubmitting ? null : _submit,
                     icon: _isSubmitting
